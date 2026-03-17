@@ -347,7 +347,11 @@ static bool try_capture_from_rx(uint8_t rx_index)
 
     size_t item_size = 0;
     rmt_item32_t *items = static_cast<rmt_item32_t *>(xRingbufferReceive(s_rx_ringbufs[rx_index], &item_size, 0));
-    if (!items || item_size < sizeof(rmt_item32_t)) {
+    if (!items) {
+        return false;
+    }
+    if (item_size < sizeof(rmt_item32_t)) {
+        vRingbufferReturnItem(s_rx_ringbufs[rx_index], items);
         return false;
     }
 
@@ -480,17 +484,17 @@ static esp_err_t init_rmt_hw()
         err = rmt_config(&rx_cfg);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Failed to configure RX%u: %s", i + 1, esp_err_to_name(err));
-            return err;
+            goto cleanup_rmt;
         }
         err = rmt_driver_install(kRxChannels[i], 2048, 0);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Failed to install RX%u: %s", i + 1, esp_err_to_name(err));
-            return err;
+            goto cleanup_rmt;
         }
         err = rmt_get_ringbuf_handle(kRxChannels[i], &s_rx_ringbufs[i]);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Failed ringbuffer RX%u: %s", i + 1, esp_err_to_name(err));
-            return err;
+            goto cleanup_rmt;
         }
     }
 
@@ -498,6 +502,14 @@ static esp_err_t init_rmt_hw()
     ESP_LOGI(TAG, "IR RMT initialized TX=%d RX={%d,%d}", static_cast<int>(kTxGpio), static_cast<int>(kRxGpios[0]),
              static_cast<int>(kRxGpios[1]));
     return ESP_OK;
+
+cleanup_rmt:
+    for (uint8_t j = 0; j < kRxCount; ++j) {
+        rmt_driver_uninstall(kRxChannels[j]);
+        s_rx_ringbufs[j] = nullptr;
+    }
+    rmt_driver_uninstall(kTxChannel);
+    return err;
 }
 
 esp_err_t ir_engine_init()
@@ -644,6 +656,9 @@ esp_err_t ir_engine_start_learning(uint32_t timeout_ms)
         esp_err_t err = rmt_rx_start(kRxChannels[i], true);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Failed to start RX%u: %s", i + 1, esp_err_to_name(err));
+            for (uint8_t j = 0; j < i; ++j) {
+                rmt_rx_stop(kRxChannels[j]);
+            }
             return err;
         }
     }
