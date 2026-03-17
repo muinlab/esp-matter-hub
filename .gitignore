@@ -5,3 +5,31 @@ esp-matter/
 # Build artifacts
 build/
 build2/
+
+# ESP-IDF generated config (track sdkconfig.defaults* only)
+sdkconfig
+sdkconfig.old
+
+# Managed components (downloaded dependencies)
+managed_components/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Monitor/terminal
+.monitor.*
+
+# IDE and editor cache
+.cache/
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Local development state
+.omc/
+.claude/
