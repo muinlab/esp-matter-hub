@@ -29,6 +29,11 @@ static constexpr uint32_t IR_MGMT_CMD_REGISTER_DEVICE       = 0x05;
 static constexpr uint32_t IR_MGMT_CMD_RENAME_DEVICE         = 0x06;
 static constexpr uint32_t IR_MGMT_CMD_ASSIGN_DEVICE_TO_SLOT = 0x07;
 static constexpr uint32_t IR_MGMT_CMD_OPEN_COMMISSIONING    = 0x08;
+static constexpr uint32_t IR_MGMT_CMD_SEND_SIGNAL           = 0x09;
+static constexpr uint32_t IR_MGMT_CMD_GET_SIGNAL_PAYLOAD    = 0x0A;
+
+/* ── Attribute IDs (extended) ─────────────────────────────────────────── */
+static constexpr uint32_t IR_MGMT_ATTR_SIGNAL_PAYLOAD_DATA  = 0x0005;
 
 /* ── Event IDs ──────────────────────────────────────────────────────────── */
 static constexpr uint32_t IR_MGMT_EVT_LEARNING_COMPLETED    = 0x00;

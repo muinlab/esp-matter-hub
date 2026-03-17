@@ -24,9 +24,12 @@ static constexpr size_t kJsonBufSlots    = 2048;
 static constexpr size_t kJsonBufDevices  = 4096;
 static constexpr size_t kJsonBufPayload  = 512;
 
+static constexpr size_t kJsonBufSignalPayload = 1024;
+
 static char s_signals_json[kJsonBufSignals];
 static char s_slots_json[kJsonBufSlots];
 static char s_devices_json[kJsonBufDevices];
+static char s_signal_payload_json[kJsonBufSignalPayload];
 static char s_payload_json[kJsonBufPayload];
 
 // ── JSON serialization ──────────────────────────────────────────────────
@@ -372,6 +375,90 @@ static esp_err_t cmd_assign_device_to_slot(const ConcreteCommandPath &path, TLVR
     return err;
 }
 
+static esp_err_t cmd_send_signal(const ConcreteCommandPath &path, TLVReader &tlv, void *opaque)
+{
+    uint32_t signal_id = 0;
+
+    chip::TLV::TLVType outer;
+    if (tlv_enter_struct(tlv, outer)) {
+        while (tlv.Next() == CHIP_NO_ERROR) {
+            if (chip::TLV::TagNumFromTag(tlv.GetTag()) == 0) {
+                tlv_read_u32(tlv, signal_id);
+            }
+        }
+        tlv.ExitContainer(outer);
+    }
+
+    if (signal_id == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ESP_LOGI(TAG, "SendSignal id=%lu", static_cast<unsigned long>(signal_id));
+    return ir_engine_send_signal(signal_id, 0xFF, 0, 0, nullptr);
+}
+
+static esp_err_t cmd_get_signal_payload(const ConcreteCommandPath &path, TLVReader &tlv, void *opaque)
+{
+    uint32_t signal_id = 0;
+
+    chip::TLV::TLVType outer;
+    if (tlv_enter_struct(tlv, outer)) {
+        while (tlv.Next() == CHIP_NO_ERROR) {
+            if (chip::TLV::TagNumFromTag(tlv.GetTag()) == 0) {
+                tlv_read_u32(tlv, signal_id);
+            }
+        }
+        tlv.ExitContainer(outer);
+    }
+
+    if (signal_id == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint16_t ticks[128] = { 0 };
+    uint8_t tick_len = 0;
+    esp_err_t err = ir_engine_get_signal_payload(signal_id, ticks, 128, &tick_len);
+    if (err != ESP_OK) {
+        s_signal_payload_json[0] = '\0';
+        return err;
+    }
+
+    const ir_signal_record_t *signals = nullptr;
+    size_t count = 0;
+    ir_engine_get_signals(&signals, &count);
+    const char *name = "";
+    uint32_t carrier = 38000;
+    uint8_t repeat = 1;
+    for (size_t i = 0; i < count; ++i) {
+        if (signals[i].signal_id == signal_id) {
+            name = signals[i].name;
+            carrier = signals[i].carrier_hz;
+            repeat = signals[i].repeat;
+            break;
+        }
+    }
+
+    int off = snprintf(s_signal_payload_json, kJsonBufSignalPayload,
+                       "{\"id\":%lu,\"name\":\"%s\",\"carrier\":%lu,\"repeat\":%u,\"ticks\":[",
+                       static_cast<unsigned long>(signal_id), name,
+                       static_cast<unsigned long>(carrier), repeat);
+    for (uint8_t i = 0; i < tick_len && static_cast<size_t>(off) < kJsonBufSignalPayload - 10; ++i) {
+        off += snprintf(s_signal_payload_json + off, kJsonBufSignalPayload - off,
+                        "%s%u", (i == 0) ? "" : ",", ticks[i]);
+    }
+    off += snprintf(s_signal_payload_json + off, kJsonBufSignalPayload - off, "]}");
+
+    ESP_LOGI(TAG, "GetSignalPayload id=%lu len=%u json=%d bytes",
+             static_cast<unsigned long>(signal_id), tick_len, off);
+
+    // Update the attribute so app can read it
+    esp_matter_attr_val_t val = esp_matter_long_char_str(s_signal_payload_json, static_cast<uint16_t>(strlen(s_signal_payload_json)));
+    attribute::set_val(s_ir_mgmt_endpoint_id, IR_MGMT_CLUSTER_ID,
+                       IR_MGMT_ATTR_SIGNAL_PAYLOAD_DATA, &val);
+
+    return ESP_OK;
+}
+
 static esp_err_t cmd_open_commissioning(const ConcreteCommandPath &path, TLVReader &tlv, void *opaque)
 {
     uint16_t timeout_s = 300;
@@ -435,6 +522,7 @@ esp_err_t ir_mgmt_cluster_init(esp_matter::node_t *node)
     if (!attribute::create(cl, IR_MGMT_ATTR_SAVED_SIGNALS_LIST, ATTRIBUTE_FLAG_NONE, val_empty_arr, static_cast<uint16_t>(kJsonBufSignals)))  { return ESP_FAIL; }
     if (!attribute::create(cl, IR_MGMT_ATTR_SLOT_ASSIGNMENTS,   ATTRIBUTE_FLAG_NONE, val_empty_arr, static_cast<uint16_t>(kJsonBufSlots)))    { return ESP_FAIL; }
     if (!attribute::create(cl, IR_MGMT_ATTR_REGISTERED_DEVICES, ATTRIBUTE_FLAG_NONE, val_empty_arr, static_cast<uint16_t>(kJsonBufDevices)))  { return ESP_FAIL; }
+    if (!attribute::create(cl, IR_MGMT_ATTR_SIGNAL_PAYLOAD_DATA, ATTRIBUTE_FLAG_NONE, val_empty_obj, static_cast<uint16_t>(kJsonBufSignalPayload))) { return ESP_FAIL; }
 
     // ── Commands (all custom + accepted) ──
 
@@ -449,6 +537,8 @@ esp_err_t ir_mgmt_cluster_init(esp_matter::node_t *node)
     if (!command::create(cl, IR_MGMT_CMD_RENAME_DEVICE,         kCmdFlags, cmd_rename_device))           { return ESP_FAIL; }
     if (!command::create(cl, IR_MGMT_CMD_ASSIGN_DEVICE_TO_SLOT, kCmdFlags, cmd_assign_device_to_slot))   { return ESP_FAIL; }
     if (!command::create(cl, IR_MGMT_CMD_OPEN_COMMISSIONING,    kCmdFlags, cmd_open_commissioning))      { return ESP_FAIL; }
+    if (!command::create(cl, IR_MGMT_CMD_SEND_SIGNAL,          kCmdFlags, cmd_send_signal))              { return ESP_FAIL; }
+    if (!command::create(cl, IR_MGMT_CMD_GET_SIGNAL_PAYLOAD,  kCmdFlags, cmd_get_signal_payload))      { return ESP_FAIL; }
 
     // ── Events ──
 

@@ -331,6 +331,61 @@ IR 학습 세션을 시작합니다. 허브의 IR 수신기가 활성화되고, 
 |----------|------|------|------|
 | `0` | uint16 | 선택 | 타임아웃 (초, 기본값 300) |
 
+#### `0x09` SendSignal
+
+저장된 IR 신호를 즉시 송신합니다. device/slot 바인딩 없이 signal_id만으로 직접 제어할 수 있어, 커스텀 앱에서 TV 볼륨, 채널, 에어컨 모드 등 다양한 버튼을 자유롭게 구현할 수 있습니다.
+
+| TLV 태그 | 타입 | 필수 | 설명 |
+|----------|------|------|------|
+| `0` | uint32 | 필수 | 송신할 signal ID |
+
+**사용 예시**: 앱이 `SavedSignalsList`에서 신호 목록을 조회한 뒤, 사용자가 선택한 신호의 ID를 `SendSignal`로 전송.
+
+#### `0x0A` GetSignalPayload
+
+저장된 IR 신호의 raw timing payload를 조회합니다. 커맨드 실행 후 `SignalPayloadData`(attr `0x0005`) 속성에 결과가 저장되므로, 커맨드 호출 → 속성 읽기 순서로 사용합니다.
+
+| TLV 태그 | 타입 | 필수 | 설명 |
+|----------|------|------|------|
+| `0` | uint32 | 필수 | 조회할 signal ID |
+
+**사용 흐름**:
+1. `GetSignalPayload(signal_id)` 커맨드 전송
+2. `SignalPayloadData`(attr `0x0005`) 읽기 → JSON 반환
+
+**응답 JSON** (attr `0x0005`에 저장):
+```json
+{
+  "id": 15,
+  "name": "light_on",
+  "carrier": 38000,
+  "repeat": 1,
+  "ticks": [9265, 4490, 636, 539, 583, 563, ...]
+}
+```
+
+| 필드 | 타입 | 설명 |
+|------|------|------|
+| `id` | uint32 | 신호 ID |
+| `name` | string | 신호 이름 |
+| `carrier` | uint32 | 반송파 주파수 (Hz) |
+| `repeat` | uint8 | 반복 횟수 |
+| `ticks` | uint16[] | IR timing 데이터 (mark/space 교대, 단위: μs) |
+
+**용도**: 앱 내 신호 백업, 다른 허브로 동기화, 신호 파형 시각화 등.
+
+### 3.4.1 속성 (확장)
+
+#### `0x0005` SignalPayloadData
+
+| 항목 | 값 |
+|------|---|
+| **타입** | LongCharString (JSON, 최대 1024 bytes) |
+| **용도** | `GetSignalPayload` 커맨드로 선택한 신호의 raw payload |
+| **갱신 시점** | `GetSignalPayload` 커맨드 호출 시 |
+
+초기값은 빈 객체(`{}`)입니다. `GetSignalPayload` 커맨드 호출 후에만 유효한 데이터가 들어갑니다.
+
 ### 3.5 이벤트 (Events)
 
 #### `0x0000` LearningCompleted
@@ -898,4 +953,11 @@ chip-tool any command-by-id 0x1337FC01 0x07 '{"0:U8":0,"1:U32":1}' <node-id> <en
 
 # OpenCommissioningWindow
 chip-tool any command-by-id 0x1337FC01 0x08 '{"0:U16":300}' <node-id> <endpoint-id>
+
+# SendSignal (임의 IR 신호 즉시 송신)
+chip-tool any command-by-id 0x1337FC01 0x09 '{"0:U32":15}' <node-id> <endpoint-id>
+
+# GetSignalPayload (신호 raw payload 조회) → 이후 attr 0x0005 읽기
+chip-tool any command-by-id 0x1337FC01 0x0A '{"0:U32":15}' <node-id> <endpoint-id>
+chip-tool any read-by-id 0x1337FC01 0x0005 <node-id> <endpoint-id>
 ```
