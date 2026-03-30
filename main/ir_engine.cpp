@@ -18,11 +18,7 @@
 #include "status_led.h"
 
 static const char *TAG = "ir_engine";
-static const char *kNvsNamespace = "ir_signals";
 static const char *kNvsCacheNamespace = "ir_cache";
-static const char *kNvsKeyTable = "table";
-static constexpr uint32_t kSignalTableVersion = 2;
-static constexpr size_t kMaxSignals = 64;
 static constexpr uint8_t kRxCount = 2;
 static constexpr gpio_num_t kTxGpio = GPIO_NUM_4;
 static constexpr gpio_num_t kRxGpios[kRxCount] = { GPIO_NUM_5, GPIO_NUM_6 };
@@ -37,13 +33,6 @@ static constexpr uint64_t kNoiseLogIntervalUs = 1000000;
 static constexpr uint8_t kMaxRepeatCount = 5;
 static constexpr uint32_t kRepeatGapUs = 12000;
 
-typedef struct ir_signal_table {
-    uint32_t version;
-    uint32_t next_signal_id;
-    uint32_t count;
-    ir_signal_record_t records[kMaxSignals];
-} ir_signal_table_t;
-
 static ir_learning_status_t s_learning = {
     .state = IR_LEARNING_IDLE,
     .elapsed_ms = 0,
@@ -55,11 +44,6 @@ static ir_learning_status_t s_learning = {
 };
 static uint64_t s_learning_started_us = 0;
 static bool s_has_pending_learning = false;
-static ir_signal_table_t s_signal_table = {
-    .version = kSignalTableVersion,
-    .next_signal_id = 1,
-    .count = 0,
-};
 static bool s_hw_initialized = false;
 static RingbufHandle_t s_rx_ringbufs[kRxCount] = { nullptr, nullptr };
 static TaskHandle_t s_learning_task = nullptr;
@@ -126,206 +110,6 @@ const signal_buffer_entry_t *ir_engine_buffer_get_all(size_t *count)
 static void make_binding_key(uint8_t slot_id, const char *suffix, char *out_key, size_t out_size)
 {
     snprintf(out_key, out_size, "s%u_%s", static_cast<unsigned>(slot_id), suffix);
-}
-
-static void make_payload_key(uint32_t signal_id, char *out_key, size_t out_size)
-{
-    snprintf(out_key, out_size, "p%" PRIu32, signal_id);
-}
-
-static esp_err_t erase_signal_namespace()
-{
-    nvs_handle_t handle;
-    esp_err_t err = nvs_open(kNvsNamespace, NVS_READWRITE, &handle);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    err = nvs_erase_all(handle);
-    if (err == ESP_OK) {
-        err = nvs_commit(handle);
-    }
-    nvs_close(handle);
-    return err;
-}
-
-static esp_err_t save_signal_payload(uint32_t signal_id, const uint16_t *payload, uint8_t payload_len)
-{
-    if (!payload || payload_len == 0) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    nvs_handle_t handle;
-    esp_err_t err = nvs_open(kNvsNamespace, NVS_READWRITE, &handle);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    char key[16];
-    make_payload_key(signal_id, key, sizeof(key));
-    err = nvs_set_blob(handle, key, payload, payload_len * sizeof(uint16_t));
-    if (err == ESP_OK) {
-        err = nvs_commit(handle);
-    }
-    nvs_close(handle);
-    return err;
-}
-
-static esp_err_t load_signal_payload(uint32_t signal_id, uint16_t *payload, size_t payload_cap, uint8_t *out_payload_len)
-{
-    if (!payload || payload_cap == 0 || !out_payload_len) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    nvs_handle_t handle;
-    esp_err_t err = nvs_open(kNvsNamespace, NVS_READONLY, &handle);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    char key[16];
-    make_payload_key(signal_id, key, sizeof(key));
-    size_t blob_size = 0;
-    err = nvs_get_blob(handle, key, nullptr, &blob_size);
-    if (err != ESP_OK) {
-        nvs_close(handle);
-        return err;
-    }
-    if (blob_size == 0 || (blob_size % sizeof(uint16_t)) != 0 || (blob_size / sizeof(uint16_t)) > payload_cap) {
-        nvs_close(handle);
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    err = nvs_get_blob(handle, key, payload, &blob_size);
-    nvs_close(handle);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    *out_payload_len = static_cast<uint8_t>(blob_size / sizeof(uint16_t));
-    return ESP_OK;
-}
-
-static esp_err_t erase_signal_payload(uint32_t signal_id)
-{
-    nvs_handle_t handle;
-    esp_err_t err = nvs_open(kNvsNamespace, NVS_READWRITE, &handle);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    char key[16];
-    make_payload_key(signal_id, key, sizeof(key));
-    err = nvs_erase_key(handle, key);
-    if (err == ESP_ERR_NVS_NOT_FOUND) {
-        nvs_close(handle);
-        return ESP_OK;
-    }
-    if (err == ESP_OK) {
-        err = nvs_commit(handle);
-    }
-    nvs_close(handle);
-    return err;
-}
-
-static esp_err_t signal_table_save()
-{
-    nvs_handle_t handle;
-    esp_err_t err = nvs_open(kNvsNamespace, NVS_READWRITE, &handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to open NVS namespace %s: %s", kNvsNamespace, esp_err_to_name(err));
-        return err;
-    }
-
-    err = nvs_set_blob(handle, kNvsKeyTable, &s_signal_table, sizeof(s_signal_table));
-    if (err == ESP_OK) {
-        err = nvs_commit(handle);
-    }
-    nvs_close(handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to save signal table: %s", esp_err_to_name(err));
-    }
-    return err;
-}
-
-static esp_err_t signal_table_load()
-{
-    nvs_handle_t handle;
-    esp_err_t err = nvs_open(kNvsNamespace, NVS_READONLY, &handle);
-    if (err == ESP_ERR_NVS_NOT_FOUND) {
-        ESP_LOGI(TAG, "No signal table found in NVS; starting empty");
-        return ESP_OK;
-    }
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to open NVS namespace %s: %s", kNvsNamespace, esp_err_to_name(err));
-        return err;
-    }
-
-    size_t required_size = 0;
-    err = nvs_get_blob(handle, kNvsKeyTable, nullptr, &required_size);
-    if (err == ESP_ERR_NVS_NOT_FOUND) {
-        nvs_close(handle);
-        ESP_LOGI(TAG, "No signal table key found; starting empty");
-        return ESP_OK;
-    }
-    if (err != ESP_OK) {
-        nvs_close(handle);
-        ESP_LOGE(TAG, "Failed reading signal table size: %s", esp_err_to_name(err));
-        return err;
-    }
-    if (required_size != sizeof(s_signal_table)) {
-        nvs_close(handle);
-        ESP_LOGW(TAG, "Signal table size mismatch (%u), resetting table", static_cast<unsigned>(required_size));
-        esp_err_t erase_err = erase_signal_namespace();
-        if (erase_err != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to erase signal namespace: %s", esp_err_to_name(erase_err));
-        }
-        memset(&s_signal_table, 0, sizeof(s_signal_table));
-        s_signal_table.version = kSignalTableVersion;
-        s_signal_table.next_signal_id = 1;
-        s_signal_table.count = 0;
-        return ESP_OK;
-    }
-
-    err = nvs_get_blob(handle, kNvsKeyTable, &s_signal_table, &required_size);
-    nvs_close(handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed loading signal table: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    if (s_signal_table.version != kSignalTableVersion || s_signal_table.count > kMaxSignals) {
-        ESP_LOGW(TAG, "Invalid signal table version/count, resetting");
-        esp_err_t erase_err = erase_signal_namespace();
-        if (erase_err != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to erase signal namespace: %s", esp_err_to_name(erase_err));
-        }
-        memset(&s_signal_table, 0, sizeof(s_signal_table));
-        s_signal_table.version = kSignalTableVersion;
-        s_signal_table.next_signal_id = 1;
-        s_signal_table.count = 0;
-        return ESP_OK;
-    }
-
-    if (s_signal_table.next_signal_id == 0) {
-        s_signal_table.next_signal_id = 1;
-    }
-
-    return ESP_OK;
-}
-
-static const ir_signal_record_t *find_signal(uint32_t signal_id)
-{
-    if (signal_id == 0) {
-        return nullptr;
-    }
-
-    for (uint32_t i = 0; i < s_signal_table.count; ++i) {
-        if (s_signal_table.records[i].signal_id == signal_id) {
-            return &s_signal_table.records[i];
-        }
-    }
-    return nullptr;
 }
 
 static void stop_rx_capture()
@@ -589,11 +373,6 @@ esp_err_t ir_engine_init()
     s_pending_rx_source = 0;
     s_pending_quality = 0;
 
-    memset(&s_signal_table, 0, sizeof(s_signal_table));
-    s_signal_table.version = kSignalTableVersion;
-    s_signal_table.next_signal_id = 1;
-    s_signal_table.count = 0;
-
     memset(s_signal_buffer, 0, sizeof(s_signal_buffer));
     s_buffer_tick = 0;
 
@@ -605,12 +384,7 @@ esp_err_t ir_engine_init()
         }
     }
 
-    esp_err_t err = signal_table_load();
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    err = init_rmt_hw();
+    esp_err_t err = init_rmt_hw();
     if (err != ESP_OK) {
         return err;
     }
@@ -624,8 +398,7 @@ esp_err_t ir_engine_init()
 
     ir_engine_load_buffer();
 
-    ESP_LOGI(TAG, "IR engine initialized (signals=%lu, next_id=%lu)", static_cast<unsigned long>(s_signal_table.count),
-             static_cast<unsigned long>(s_signal_table.next_signal_id));
+    ESP_LOGI(TAG, "IR engine initialized");
     return ESP_OK;
 }
 
@@ -661,49 +434,8 @@ esp_err_t ir_engine_send_signal(uint32_t signal_id, uint8_t slot_id, uint32_t cl
         repeat = buf_entry->repeat;
         memcpy(items, buf_entry->items, item_count * sizeof(rmt_item32_t));
     } else {
-        // Buffer miss: load from NVS signal store
-        const ir_signal_record_t *signal = find_signal(signal_id);
-        if (!signal) {
-            ESP_LOGW(TAG, "Signal %" PRIu32 " not found", signal_id);
-            return ESP_ERR_NOT_FOUND;
-        }
-        if (signal->payload_len == 0 || signal->payload_len > (sizeof(s_pending_payload) / sizeof(s_pending_payload[0]))) {
-            ESP_LOGW(TAG, "Signal %" PRIu32 " has invalid payload_len=%u", signal_id, signal->payload_len);
-            return ESP_ERR_INVALID_STATE;
-        }
-
-        uint16_t payload_ticks[128] = { 0 };
-        uint8_t loaded_len = 0;
-        esp_err_t load_err = load_signal_payload(signal_id, payload_ticks, sizeof(payload_ticks) / sizeof(payload_ticks[0]), &loaded_len);
-        if (load_err != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to load payload for signal %" PRIu32 ": %s", signal_id, esp_err_to_name(load_err));
-            return load_err;
-        }
-        if (loaded_len == 0 || loaded_len != signal->payload_len) {
-            ESP_LOGW(TAG, "Payload length mismatch for signal %" PRIu32 " meta=%u actual=%u", signal_id, signal->payload_len, loaded_len);
-            return ESP_ERR_INVALID_STATE;
-        }
-
-        item_count = ticks_to_rmt_items(payload_ticks, loaded_len, items, sizeof(items) / sizeof(items[0]));
-        if (item_count == 0) {
-            ESP_LOGE(TAG, "payload too long for TX buffer: %u", loaded_len);
-            return ESP_ERR_INVALID_SIZE;
-        }
-
-        carrier_hz = signal->carrier_hz;
-        repeat = signal->repeat == 0 ? 1 : signal->repeat;
-
-        // Store in buffer
-        signal_buffer_entry_t *slot = buffer_find_slot(signal_id);
-        if (slot) {
-            slot->signal_id = signal_id;
-            slot->carrier_hz = carrier_hz;
-            slot->repeat = repeat;
-            slot->item_count = item_count;
-            slot->last_used = ++s_buffer_tick;
-            slot->valid = true;
-            memcpy(slot->items, items, item_count * sizeof(rmt_item32_t));
-        }
+        ESP_LOGW(TAG, "Signal %" PRIu32 " not found in buffer", signal_id);
+        return ESP_ERR_NOT_FOUND;
     }
 
     if (repeat > kMaxRepeatCount) {
@@ -780,77 +512,6 @@ esp_err_t ir_engine_start_learning(uint32_t timeout_ms)
     return ESP_OK;
 }
 
-esp_err_t ir_engine_commit_learning(const char *name, const char *device_type, uint32_t *out_signal_id)
-{
-    update_learning_capture();
-
-    if (s_learning.state != IR_LEARNING_READY || !s_has_pending_learning || s_pending_payload_len == 0) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    if (s_signal_table.count >= kMaxSignals) {
-        return ESP_ERR_NO_MEM;
-    }
-
-    ir_signal_record_t *record = &s_signal_table.records[s_signal_table.count];
-    memset(record, 0, sizeof(*record));
-
-    const uint32_t new_id = s_signal_table.next_signal_id;
-    record->signal_id = new_id;
-    record->carrier_hz = 38000;
-    record->repeat = 1;
-    record->payload_len = s_pending_payload_len;
-    record->created_at_ms = static_cast<uint64_t>(esp_timer_get_time() / 1000ULL);
-
-    if (name && name[0] != '\0') {
-        strlcpy(record->name, name, sizeof(record->name));
-    } else {
-        snprintf(record->name, sizeof(record->name), "signal-%" PRIu32, new_id);
-    }
-
-    if (device_type && device_type[0] != '\0') {
-        strlcpy(record->device_type, device_type, sizeof(record->device_type));
-    } else {
-        strlcpy(record->device_type, "unknown", sizeof(record->device_type));
-    }
-
-    s_signal_table.count++;
-    s_signal_table.next_signal_id++;
-
-    esp_err_t err = save_signal_payload(new_id, s_pending_payload, s_pending_payload_len);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to save payload id=%" PRIu32 ": %s", new_id, esp_err_to_name(err));
-        s_signal_table.count--;
-        s_signal_table.next_signal_id--;
-        memset(record, 0, sizeof(*record));
-        return err;
-    }
-
-    err = signal_table_save();
-    if (err != ESP_OK) {
-        s_signal_table.count--;
-        s_signal_table.next_signal_id--;
-        memset(record, 0, sizeof(*record));
-        (void)erase_signal_payload(new_id);
-        return err;
-    }
-
-    s_learning.last_signal_id = new_id;
-    s_learning.state = IR_LEARNING_IDLE;
-    s_learning.elapsed_ms = 0;
-    s_learning.timeout_ms = 0;
-    s_learning_started_us = 0;
-    s_has_pending_learning = false;
-    status_led_set_learning(IR_LEARNING_IDLE);
-
-    if (out_signal_id) {
-        *out_signal_id = new_id;
-    }
-
-    ESP_LOGI(TAG, "Committed learned signal id=%" PRIu32 " name=%s type=%s rx=%u len=%u", new_id, record->name,
-             record->device_type, s_pending_rx_source, s_pending_payload_len);
-    return ESP_OK;
-}
-
 void ir_engine_get_learning_status(ir_learning_status_t *status)
 {
     if (!status) {
@@ -861,81 +522,16 @@ void ir_engine_get_learning_status(ir_learning_status_t *status)
     *status = s_learning;
 }
 
-esp_err_t ir_engine_get_signals(const ir_signal_record_t **signals, size_t *count)
+const uint16_t *ir_engine_get_learned_ticks(uint8_t *out_len, uint32_t *out_carrier)
 {
-    if (!signals || !count) {
-        return ESP_ERR_INVALID_ARG;
+    if (s_learning.state != IR_LEARNING_READY || s_pending_payload_len == 0) {
+        if (out_len) *out_len = 0;
+        if (out_carrier) *out_carrier = 0;
+        return nullptr;
     }
-
-    *signals = s_signal_table.records;
-    *count = s_signal_table.count;
-    return ESP_OK;
-}
-
-esp_err_t ir_engine_get_signal_payload(uint32_t signal_id, uint16_t *payload_ticks, size_t payload_cap, uint8_t *out_payload_len)
-{
-    const ir_signal_record_t *signal = find_signal(signal_id);
-    if (!signal) {
-        return ESP_ERR_NOT_FOUND;
-    }
-    if (signal->payload_len == 0 || payload_cap < signal->payload_len) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    uint8_t loaded_len = 0;
-    esp_err_t err = load_signal_payload(signal_id, payload_ticks, payload_cap, &loaded_len);
-    if (err != ESP_OK) {
-        return err;
-    }
-    if (loaded_len != signal->payload_len) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    *out_payload_len = loaded_len;
-    return ESP_OK;
-}
-
-esp_err_t ir_engine_delete_signal(uint32_t signal_id)
-{
-    if (signal_id == 0) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    uint32_t index = UINT32_MAX;
-    for (uint32_t i = 0; i < s_signal_table.count; ++i) {
-        if (s_signal_table.records[i].signal_id == signal_id) {
-            index = i;
-            break;
-        }
-    }
-    if (index == UINT32_MAX) {
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    if (index + 1 < s_signal_table.count) {
-        memmove(&s_signal_table.records[index], &s_signal_table.records[index + 1],
-                (s_signal_table.count - index - 1) * sizeof(s_signal_table.records[0]));
-    }
-    s_signal_table.count--;
-    memset(&s_signal_table.records[s_signal_table.count], 0, sizeof(s_signal_table.records[s_signal_table.count]));
-
-    esp_err_t err = signal_table_save();
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    err = erase_signal_payload(signal_id);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Deleted signal metadata but failed to erase payload id=%" PRIu32 ": %s", signal_id,
-                 esp_err_to_name(err));
-    }
-
-    if (s_learning.last_signal_id == signal_id) {
-        s_learning.last_signal_id = 0;
-    }
-
-    ESP_LOGI(TAG, "Deleted signal id=%" PRIu32, signal_id);
-    return ESP_OK;
+    if (out_len) *out_len = s_pending_payload_len;
+    if (out_carrier) *out_carrier = 38000;  // IR learning uses default carrier
+    return s_pending_payload;
 }
 
 // ---- Buffer public API ----
@@ -955,6 +551,78 @@ static void persist_buffer_to_nvs();
 void ir_engine_flush_buffer_to_nvs()
 {
     persist_buffer_to_nvs();
+    // Clear buffer after persisting
+    for (int i = 0; i < SIGNAL_BUFFER_SIZE; ++i) {
+        s_signal_buffer[i].valid = false;
+    }
+    ESP_LOGI(TAG, "Buffer cleared after NVS persist");
+}
+
+int ir_engine_read_all_nvs_signals(char *out_json, size_t out_size)
+{
+    if (!out_json || out_size < 3) return 0;
+
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(kNvsCacheNamespace, NVS_READONLY, &handle);
+    if (err != ESP_OK) {
+        snprintf(out_json, out_size, "[]");
+        return 2;
+    }
+
+    int off = 0;
+    off += snprintf(out_json + off, out_size - off, "[");
+    bool first = true;
+
+    // Iterate NVS entries starting with 'c' in ir_cache namespace
+    nvs_iterator_t it = nullptr;
+    err = nvs_entry_find("nvs", kNvsCacheNamespace, NVS_TYPE_BLOB, &it);
+    while (err == ESP_OK && it != nullptr) {
+        nvs_entry_info_t info;
+        nvs_entry_info(it, &info);
+
+        // Only process signal keys (c{id})
+        if (info.key[0] == 'c' && info.key[1] >= '0' && info.key[1] <= '9') {
+            size_t blob_size = 0;
+            if (nvs_get_blob(handle, info.key, nullptr, &blob_size) == ESP_OK && blob_size >= 11) {
+                uint8_t blob[4 + 4 + 1 + 2 + 4 + 8 + 128 * 2];
+                if (blob_size <= sizeof(blob) && nvs_get_blob(handle, info.key, blob, &blob_size) == ESP_OK) {
+                    uint32_t sig_id, carr;
+                    uint8_t rep;
+                    uint16_t tc;
+                    uint32_t ref_count = 0;
+                    int64_t last_seen = 0;
+                    size_t p = 0;
+                    memcpy(&sig_id, blob + p, 4); p += 4;
+                    memcpy(&carr,   blob + p, 4); p += 4;
+                    memcpy(&rep,    blob + p, 1); p += 1;
+                    memcpy(&tc,     blob + p, 2); p += 2;
+                    // New format has ref_count + last_seen_at
+                    if (blob_size >= p + 4 + 8) {
+                        memcpy(&ref_count, blob + p, 4); p += 4;
+                        memcpy(&last_seen, blob + p, 8); p += 8;
+                    }
+
+                    if (off < (int)(out_size - 120)) {
+                        off += snprintf(out_json + off, out_size - off,
+                                        "%s{\"signal_id\":%lu,\"carrier_hz\":%lu,\"repeat\":%u,\"tick_count\":%u,\"ref_count\":%lu,\"last_seen_at\":%lld}",
+                                        first ? "" : ",",
+                                        static_cast<unsigned long>(sig_id),
+                                        static_cast<unsigned long>(carr),
+                                        rep, tc,
+                                        static_cast<unsigned long>(ref_count),
+                                        static_cast<long long>(last_seen));
+                        first = false;
+                    }
+                }
+            }
+        }
+        err = nvs_entry_next(&it);
+    }
+    if (it) nvs_release_iterator(it);
+
+    off += snprintf(out_json + off, out_size - off, "]");
+    nvs_close(handle);
+    return off;
 }
 
 static void persist_buffer_to_nvs()

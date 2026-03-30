@@ -548,41 +548,6 @@ static esp_err_t learn_start_post_handler(httpd_req_t *req)
     return send_json(req, "{\"status\":\"ok\",\"learning\":\"started\"}");
 }
 
-static esp_err_t learn_commit_post_handler(httpd_req_t *req)
-{
-    if (!check_api_key(req)) { return ESP_OK; }
-    char name[48] = { 0 };
-    char device_type[24] = { 0 };
-
-    if (req->content_len > 0 && req->content_len < 256) {
-        char body[256];
-        int read_len = httpd_req_recv(req, body, req->content_len);
-        if (read_len > 0) {
-            body[read_len] = '\0';
-            parse_string_field(body, "name", name, sizeof(name));
-            parse_string_field(body, "device_type", device_type, sizeof(device_type));
-        }
-    }
-
-    uint32_t signal_id = 0;
-    esp_err_t err = ir_engine_commit_learning(name, device_type, &signal_id);
-    if (err == ESP_ERR_INVALID_STATE) {
-        httpd_resp_set_status(req, "409 Conflict");
-        return send_json(req, "{\"status\":\"error\",\"message\":\"no pending learned signal\"}");
-    }
-    if (err == ESP_ERR_NO_MEM) {
-        httpd_resp_set_status(req, "507 Insufficient Storage");
-        return send_json(req, "{\"status\":\"error\",\"message\":\"signal storage full\"}");
-    }
-    if (err != ESP_OK) {
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "failed to commit learned signal");
-    }
-
-    char response[192];
-    snprintf(response, sizeof(response), "{\"status\":\"ok\",\"signal_id\":%lu}", static_cast<unsigned long>(signal_id));
-    return send_json(req, response);
-}
-
 static esp_err_t learn_status_get_handler(httpd_req_t *req)
 {
     ir_learning_status_t status;
@@ -675,17 +640,6 @@ esp_err_t app_web_server_start()
         .user_ctx = nullptr,
     };
     err = register_uri_handler_checked(s_server, &learn_status_uri);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    const httpd_uri_t learn_commit_uri = {
-        .uri = "/api/learn/commit",
-        .method = HTTP_POST,
-        .handler = learn_commit_post_handler,
-        .user_ctx = nullptr,
-    };
-    err = register_uri_handler_checked(s_server, &learn_commit_uri);
     if (err != ESP_OK) {
         return err;
     }

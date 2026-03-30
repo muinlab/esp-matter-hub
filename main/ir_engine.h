@@ -24,17 +24,6 @@ typedef struct ir_learning_status {
     uint16_t quality_score;
 } ir_learning_status_t;
 
-typedef struct ir_signal_record {
-    uint32_t signal_id;
-    uint32_t carrier_hz;
-    uint8_t repeat;
-    uint8_t payload_len;
-    uint8_t reserved[2];
-    uint64_t created_at_ms;
-    char name[48];
-    char device_type[24];
-} ir_signal_record_t;
-
 #define SIGNAL_BUFFER_SIZE 16
 
 typedef struct signal_buffer_entry {
@@ -60,10 +49,8 @@ void ir_engine_load_buffer();
 const signal_buffer_entry_t *ir_engine_buffer_lookup(uint32_t signal_id);
 const signal_buffer_entry_t *ir_engine_buffer_get_all(size_t *count);
 void ir_engine_flush_buffer_to_nvs();
+int ir_engine_read_all_nvs_signals(char *out_json, size_t out_size);
 
 esp_err_t ir_engine_start_learning(uint32_t timeout_ms);
-esp_err_t ir_engine_commit_learning(const char *name, const char *device_type, uint32_t *out_signal_id);
 void ir_engine_get_learning_status(ir_learning_status_t *status);
-esp_err_t ir_engine_get_signals(const ir_signal_record_t **signals, size_t *count);
-esp_err_t ir_engine_get_signal_payload(uint32_t signal_id, uint16_t *payload_ticks, size_t payload_cap, uint8_t *out_payload_len);
-esp_err_t ir_engine_delete_signal(uint32_t signal_id);
+const uint16_t *ir_engine_get_learned_ticks(uint8_t *out_len, uint32_t *out_carrier);

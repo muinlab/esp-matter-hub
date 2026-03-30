@@ -27,76 +27,45 @@ extern int8_t    bridge_action_get_slot_for_device(uint32_t device_id);
 
 // ── JSON buffer sizes (single-threaded Matter stack → static is safe) ───
 
-static constexpr size_t kJsonBufSignals       = 8192;
-static constexpr size_t kJsonBufPayload       = 512;
-static constexpr size_t kJsonBufSignalPayload = 1024;
+static constexpr size_t kJsonBufPayload = 1280;
 
-static char s_signals_json[kJsonBufSignals];
-static char s_signal_payload_json[kJsonBufSignalPayload];
 static char s_payload_json[kJsonBufPayload];
 
 // ── JSON serialization ──────────────────────────────────────────────────
-
-static int serialize_signals_json(char *buf, size_t cap)
-{
-    const ir_signal_record_t *signals = nullptr;
-    size_t count = 0;
-    if (ir_engine_get_signals(&signals, &count) != ESP_OK) {
-        return snprintf(buf, cap, "[]");
-    }
-
-    int off = snprintf(buf, cap, "[");
-    for (size_t i = 0; i < count && static_cast<size_t>(off) < cap - 2; ++i) {
-        off += snprintf(buf + off, cap - off,
-                        "%s{\"id\":%lu,\"name\":\"%s\",\"type\":\"%s\",\"carrier\":%lu,\"repeat\":%u,\"len\":%u}",
-                        (i == 0) ? "" : ",",
-                        static_cast<unsigned long>(signals[i].signal_id),
-                        signals[i].name, signals[i].device_type,
-                        static_cast<unsigned long>(signals[i].carrier_hz),
-                        signals[i].repeat, signals[i].payload_len);
-    }
-    off += snprintf(buf + off, cap - off, "]");
-    return off;
-}
 
 static int serialize_learned_payload_json(char *buf, size_t cap)
 {
     ir_learning_status_t status;
     ir_engine_get_learning_status(&status);
 
-    return snprintf(buf, cap,
-                    "{\"state\":%u,\"elapsed\":%lu,\"timeout\":%lu,"
-                    "\"last_id\":%lu,\"rx\":%u,\"len\":%u,\"quality\":%u}",
-                    static_cast<unsigned>(status.state),
-                    static_cast<unsigned long>(status.elapsed_ms),
-                    static_cast<unsigned long>(status.timeout_ms),
-                    static_cast<unsigned long>(status.last_signal_id),
-                    status.rx_source, status.captured_len, status.quality_score);
-}
+    int off = snprintf(buf, cap,
+                       "{\"state\":%u,\"elapsed\":%lu,\"timeout\":%lu,"
+                       "\"last_id\":%lu,\"rx\":%u,\"len\":%u,\"quality\":%u",
+                       static_cast<unsigned>(status.state),
+                       static_cast<unsigned long>(status.elapsed_ms),
+                       static_cast<unsigned long>(status.timeout_ms),
+                       static_cast<unsigned long>(status.last_signal_id),
+                       status.rx_source, status.captured_len, status.quality_score);
 
-// ── CacheStatus bitmap ─────────────────────────────────────────────────
-// 1 bit per slot; bit=1 if the slot has at least one cached signal
-// Each slot has up to 4 signal references (on/off/up/down) — we check via
-// bridge_action_get_slots() then ir_engine_buffer_lookup() for each signal_id.
-
-static uint8_t build_cache_status_bitmap()
-{
-    size_t slot_count = 0;
-    const bridge_slot_state_t *slots = bridge_action_get_slots(&slot_count);
-    if (!slots || slot_count == 0) return 0;
-
-    uint8_t bitmap = 0;
-    for (size_t i = 0; i < slot_count && i < 8; ++i) {
-        const bridge_slot_state_t &s = slots[i];
-        uint32_t sigs[2] = { s.signal_id_a, s.signal_id_b };
-        for (int j = 0; j < 2; ++j) {
-            if (sigs[j] != 0 && ir_engine_buffer_lookup(sigs[j]) != nullptr) {
-                bitmap |= static_cast<uint8_t>(1u << i);
-                break;
+    // Include ticks data when learning is READY
+    if (status.state == IR_LEARNING_READY) {
+        uint8_t tick_len = 0;
+        uint32_t carrier = 0;
+        const uint16_t *ticks = ir_engine_get_learned_ticks(&tick_len, &carrier);
+        if (ticks && tick_len > 0) {
+            off += snprintf(buf + off, cap - off, ",\"carrier\":%lu,\"ticks\":\"",
+                            static_cast<unsigned long>(carrier));
+            for (uint8_t i = 0; i < tick_len && off < (int)(cap - 6); ++i) {
+                // LE byte order — matches SendSignalWithRaw BYTES format
+                off += snprintf(buf + off, cap - off, "%02X%02X",
+                                ticks[i] & 0xFF, (ticks[i] >> 8) & 0xFF);
             }
+            off += snprintf(buf + off, cap - off, "\"");
         }
     }
-    return bitmap;
+
+    off += snprintf(buf + off, cap - off, "}");
+    return off;
 }
 
 // ── Attribute push refresh ──────────────────────────────────────────────
@@ -115,16 +84,6 @@ static void refresh_all_attributes()
     esp_matter_attr_val_t v_payload = esp_matter_long_char_str(s_payload_json, static_cast<uint16_t>(len));
     attribute::set_val(s_ir_mgmt_endpoint_id, IR_MGMT_CLUSTER_ID,
                        IR_MGMT_ATTR_LEARNED_PAYLOAD, &v_payload);
-
-    len = serialize_signals_json(s_signals_json, sizeof(s_signals_json));
-    esp_matter_attr_val_t v_signals = esp_matter_long_char_str(s_signals_json, static_cast<uint16_t>(len));
-    attribute::set_val(s_ir_mgmt_endpoint_id, IR_MGMT_CLUSTER_ID,
-                       IR_MGMT_ATTR_SAVED_SIGNALS_LIST, &v_signals);
-
-    uint8_t cache_bm = build_cache_status_bitmap();
-    esp_matter_attr_val_t v_cache = esp_matter_uint8(cache_bm);
-    attribute::set_val(s_ir_mgmt_endpoint_id, IR_MGMT_CLUSTER_ID,
-                       IR_MGMT_ATTR_CACHE_STATUS, &v_cache);
 }
 
 // ── TLV helpers ─────────────────────────────────────────────────────────
@@ -192,59 +151,6 @@ static esp_err_t cmd_cancel_learning(const ConcreteCommandPath &path, TLVReader 
     return ESP_ERR_NOT_SUPPORTED;
 }
 
-static esp_err_t cmd_save_signal(const ConcreteCommandPath &path, TLVReader &tlv, void *opaque)
-{
-    char name[48] = {0};
-    char device_type[24] = {0};
-
-    chip::TLV::TLVType outer;
-    if (tlv_enter_struct(tlv, outer)) {
-        while (tlv.Next() == CHIP_NO_ERROR) {
-            uint32_t tag = chip::TLV::TagNumFromTag(tlv.GetTag());
-            if (tag == 0) { tlv_read_string(tlv, name, sizeof(name)); }
-            else if (tag == 1) { tlv_read_string(tlv, device_type, sizeof(device_type)); }
-        }
-        tlv.ExitContainer(outer);
-    }
-
-    uint32_t signal_id = 0;
-    esp_err_t err = ir_engine_commit_learning(name, device_type, &signal_id);
-    if (err == ESP_OK) {
-        ESP_LOGI(TAG, "SaveSignal ok signal_id=%lu", static_cast<unsigned long>(signal_id));
-        refresh_all_attributes();
-    }
-    return err;
-}
-
-static esp_err_t cmd_delete_signal(const ConcreteCommandPath &path, TLVReader &tlv, void *opaque)
-{
-    uint32_t signal_id = 0;
-
-    chip::TLV::TLVType outer;
-    if (tlv_enter_struct(tlv, outer)) {
-        while (tlv.Next() == CHIP_NO_ERROR) {
-            if (chip::TLV::TagNumFromTag(tlv.GetTag()) == 0) {
-                tlv_read_u32(tlv, signal_id);
-            }
-        }
-        tlv.ExitContainer(outer);
-    }
-
-    if (signal_id == 0) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    esp_err_t err = bridge_action_unbind_signal_references(signal_id);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    ESP_LOGI(TAG, "DeleteSignal id=%lu", static_cast<unsigned long>(signal_id));
-    err = ir_engine_delete_signal(signal_id);
-    if (err == ESP_OK) refresh_all_attributes();
-    return err;
-}
-
 static esp_err_t cmd_open_commissioning(const ConcreteCommandPath &path, TLVReader &tlv, void *opaque)
 {
     uint16_t timeout_s = 300;
@@ -261,67 +167,6 @@ static esp_err_t cmd_open_commissioning(const ConcreteCommandPath &path, TLVRead
 
     ESP_LOGI(TAG, "OpenCommissioningWindow timeout_s=%u", timeout_s);
     return app_open_commissioning_window(timeout_s);
-}
-
-static esp_err_t cmd_get_signal_payload(const ConcreteCommandPath &path, TLVReader &tlv, void *opaque)
-{
-    uint32_t signal_id = 0;
-
-    chip::TLV::TLVType outer;
-    if (tlv_enter_struct(tlv, outer)) {
-        while (tlv.Next() == CHIP_NO_ERROR) {
-            if (chip::TLV::TagNumFromTag(tlv.GetTag()) == 0) {
-                tlv_read_u32(tlv, signal_id);
-            }
-        }
-        tlv.ExitContainer(outer);
-    }
-
-    if (signal_id == 0) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    uint16_t ticks[128] = { 0 };
-    uint8_t tick_len = 0;
-    esp_err_t err = ir_engine_get_signal_payload(signal_id, ticks, 128, &tick_len);
-    if (err != ESP_OK) {
-        s_signal_payload_json[0] = '\0';
-        return err;
-    }
-
-    const ir_signal_record_t *signals = nullptr;
-    size_t count = 0;
-    ir_engine_get_signals(&signals, &count);
-    const char *name = "";
-    uint32_t carrier = 38000;
-    uint8_t repeat = 1;
-    for (size_t i = 0; i < count; ++i) {
-        if (signals[i].signal_id == signal_id) {
-            name = signals[i].name;
-            carrier = signals[i].carrier_hz;
-            repeat = signals[i].repeat;
-            break;
-        }
-    }
-
-    int off = snprintf(s_signal_payload_json, kJsonBufSignalPayload,
-                       "{\"id\":%lu,\"name\":\"%s\",\"carrier\":%lu,\"repeat\":%u,\"ticks\":[",
-                       static_cast<unsigned long>(signal_id), name,
-                       static_cast<unsigned long>(carrier), repeat);
-    for (uint8_t i = 0; i < tick_len && static_cast<size_t>(off) < kJsonBufSignalPayload - 10; ++i) {
-        off += snprintf(s_signal_payload_json + off, kJsonBufSignalPayload - off,
-                        "%s%u", (i == 0) ? "" : ",", ticks[i]);
-    }
-    off += snprintf(s_signal_payload_json + off, kJsonBufSignalPayload - off, "]}");
-
-    ESP_LOGI(TAG, "GetSignalPayload id=%lu len=%u json=%d bytes",
-             static_cast<unsigned long>(signal_id), tick_len, off);
-
-    esp_matter_attr_val_t val = esp_matter_long_char_str(s_signal_payload_json, static_cast<uint16_t>(strlen(s_signal_payload_json)));
-    attribute::set_val(s_ir_mgmt_endpoint_id, IR_MGMT_CLUSTER_ID,
-                       IR_MGMT_ATTR_SIGNAL_PAYLOAD_DATA, &val);
-
-    return ESP_OK;
 }
 
 static esp_err_t cmd_send_signal_with_raw(const ConcreteCommandPath &path, TLVReader &tlv, void *opaque)
@@ -425,6 +270,25 @@ static esp_err_t cmd_factory_reset(const ConcreteCommandPath &path, TLVReader &t
     return ESP_OK;
 }
 
+static esp_err_t cmd_dump_nvs(const ConcreteCommandPath &path, TLVReader &tlv, void *opaque)
+{
+    ESP_LOGI(TAG, "DumpNVS: sync buffer then read all NVS signals");
+
+    // Step 1: Flush buffer to NVS + clear buffer
+    ir_engine_flush_buffer_to_nvs();
+
+    // Step 2: Read all NVS signals into BufferSnapshot attribute
+    char buf[2048];
+    int len = ir_engine_read_all_nvs_signals(buf, sizeof(buf));
+
+    esp_matter_attr_val_t val = esp_matter_long_char_str(buf, static_cast<uint16_t>(len));
+    esp_matter::attribute::set_val(s_ir_mgmt_endpoint_id, IR_MGMT_CLUSTER_ID, IR_MGMT_ATTR_BUFFER_SNAPSHOT, &val);
+
+    ESP_LOGI(TAG, "DumpNVS: wrote %d bytes to BufferSnapshot", len);
+    refresh_all_attributes();
+    return ESP_OK;
+}
+
 // ── Cluster init ────────────────────────────────────────────────────────
 
 esp_err_t ir_mgmt_cluster_init(esp_matter::node_t *node)
@@ -468,14 +332,9 @@ esp_err_t ir_mgmt_cluster_init(esp_matter::node_t *node)
     esp_matter_attr_val_t val_empty_obj = esp_matter_long_char_str(const_cast<char *>("{}"), 2);
     esp_matter_attr_val_t val_empty_arr = esp_matter_long_char_str(const_cast<char *>("[]"), 2);
 
-    if (!attribute::create(cl, IR_MGMT_ATTR_LEARNED_PAYLOAD,    ATTRIBUTE_FLAG_NONE, val_empty_obj, static_cast<uint16_t>(kJsonBufPayload)))       { return ESP_FAIL; }
-    if (!attribute::create(cl, IR_MGMT_ATTR_SAVED_SIGNALS_LIST, ATTRIBUTE_FLAG_NONE, val_empty_arr, static_cast<uint16_t>(kJsonBufSignals)))        { return ESP_FAIL; }
-    if (!attribute::create(cl, IR_MGMT_ATTR_SIGNAL_PAYLOAD_DATA, ATTRIBUTE_FLAG_NONE, val_empty_obj, static_cast<uint16_t>(kJsonBufSignalPayload))) { return ESP_FAIL; }
+    if (!attribute::create(cl, IR_MGMT_ATTR_LEARNED_PAYLOAD,    ATTRIBUTE_FLAG_NONE, val_empty_obj, 1280))       { return ESP_FAIL; }
 
-    esp_matter_attr_val_t val_cache = esp_matter_uint8(0);
-    if (!attribute::create(cl, IR_MGMT_ATTR_CACHE_STATUS, ATTRIBUTE_FLAG_NONE, val_cache)) { return ESP_FAIL; }
-
-    if (!attribute::create(cl, IR_MGMT_ATTR_BUFFER_SNAPSHOT, ATTRIBUTE_FLAG_NONE, val_empty_arr, 1024)) { return ESP_FAIL; }
+    if (!attribute::create(cl, IR_MGMT_ATTR_BUFFER_SNAPSHOT, ATTRIBUTE_FLAG_NONE, val_empty_arr, 2048)) { return ESP_FAIL; }
 
     // ── Commands (all custom + accepted) ──
 
@@ -483,13 +342,12 @@ esp_err_t ir_mgmt_cluster_init(esp_matter::node_t *node)
 
     if (!command::create(cl, IR_MGMT_CMD_START_LEARNING,       kCmdFlags, cmd_start_learning))      { return ESP_FAIL; }
     if (!command::create(cl, IR_MGMT_CMD_CANCEL_LEARNING,      kCmdFlags, cmd_cancel_learning))     { return ESP_FAIL; }
-    if (!command::create(cl, IR_MGMT_CMD_SAVE_SIGNAL,          kCmdFlags, cmd_save_signal))         { return ESP_FAIL; }
-    if (!command::create(cl, IR_MGMT_CMD_DELETE_SIGNAL,        kCmdFlags, cmd_delete_signal))       { return ESP_FAIL; }
+    // SaveSignal(0x02) removed in v3.2.1
     if (!command::create(cl, IR_MGMT_CMD_OPEN_COMMISSIONING,   kCmdFlags, cmd_open_commissioning))  { return ESP_FAIL; }
-    if (!command::create(cl, IR_MGMT_CMD_GET_SIGNAL_PAYLOAD,   kCmdFlags, cmd_get_signal_payload))  { return ESP_FAIL; }
     if (!command::create(cl, IR_MGMT_CMD_SEND_SIGNAL_WITH_RAW, kCmdFlags, cmd_send_signal_with_raw)) { return ESP_FAIL; }
     if (!command::create(cl, IR_MGMT_CMD_SYNC_BUFFER,          kCmdFlags, cmd_sync_buffer))          { return ESP_FAIL; }
     if (!command::create(cl, IR_MGMT_CMD_FACTORY_RESET,       kCmdFlags, cmd_factory_reset))       { return ESP_FAIL; }
+    if (!command::create(cl, IR_MGMT_CMD_DUMP_NVS,            kCmdFlags, cmd_dump_nvs))            { return ESP_FAIL; }
 
     // ── Events ──
 

@@ -37,8 +37,9 @@ run_cmd() {
     /exit|exit|quit)   return 99 ;;
     /learn_state)      learn_state ;;
     /learned_payload)  learned_payload ;;
-    /signals)          signals ;;
-    /cache_status)     cache_status ;;
+    /buffer_snapshot)  buffer_snapshot ;;
+    /sync_buffer)      sync_buffer ;;
+    /factory_reset)    factory_reset ;;
     /smoke)            smoke ;;
     /pair)             pair ;;
     /unpair)           unpair ;;

@@ -15,21 +15,16 @@ static constexpr uint32_t IR_MGMT_CLUSTER_ID = 0x1337FC01;
 /* ── Attribute IDs ──────────────────────────────────────────────────────── */
 static constexpr uint32_t IR_MGMT_ATTR_LEARN_STATE          = 0x0000;
 static constexpr uint32_t IR_MGMT_ATTR_LEARNED_PAYLOAD      = 0x0001;
-static constexpr uint32_t IR_MGMT_ATTR_SAVED_SIGNALS_LIST   = 0x0002;
-static constexpr uint32_t IR_MGMT_ATTR_SIGNAL_PAYLOAD_DATA  = 0x0005;
-static constexpr uint32_t IR_MGMT_ATTR_CACHE_STATUS         = 0x0006;
 static constexpr uint32_t IR_MGMT_ATTR_BUFFER_SNAPSHOT      = 0x0007;
 
 /* ── Command IDs (client → server, i.e. "accepted") ────────────────────── */
 static constexpr uint32_t IR_MGMT_CMD_START_LEARNING        = 0x00;
 static constexpr uint32_t IR_MGMT_CMD_CANCEL_LEARNING       = 0x01;
-static constexpr uint32_t IR_MGMT_CMD_SAVE_SIGNAL           = 0x02;
-static constexpr uint32_t IR_MGMT_CMD_DELETE_SIGNAL         = 0x03;
 static constexpr uint32_t IR_MGMT_CMD_OPEN_COMMISSIONING    = 0x08;
-static constexpr uint32_t IR_MGMT_CMD_GET_SIGNAL_PAYLOAD    = 0x0A;
 static constexpr uint32_t IR_MGMT_CMD_SEND_SIGNAL_WITH_RAW  = 0x0B;
 static constexpr uint32_t IR_MGMT_CMD_SYNC_BUFFER           = 0x0C;
 static constexpr uint32_t IR_MGMT_CMD_FACTORY_RESET         = 0x0D;
+static constexpr uint32_t IR_MGMT_CMD_DUMP_NVS              = 0x0E;
 
 /* ── Event IDs ──────────────────────────────────────────────────────────── */
 static constexpr uint32_t IR_MGMT_EVT_LEARNING_COMPLETED    = 0x00;
