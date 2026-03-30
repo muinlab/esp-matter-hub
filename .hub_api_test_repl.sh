@@ -38,8 +38,7 @@ run_cmd() {
     /learn_state)      learn_state ;;
     /learned_payload)  learned_payload ;;
     /signals)          signals ;;
-    /slots)            slots ;;
-    /devices)          devices ;;
+    /cache_status)     cache_status ;;
     /smoke)            smoke ;;
     /pair)             pair ;;
     /unpair)           unpair ;;

@@ -1,6 +1,7 @@
 #include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #include <driver/rmt.h>
 #include <esp_log.h>
@@ -8,14 +9,17 @@
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/ringbuf.h>
+#include <freertos/semphr.h>
 #include <freertos/task.h>
 #include <nvs.h>
 
+#include "bridge_action.h"
 #include "ir_engine.h"
 #include "status_led.h"
 
 static const char *TAG = "ir_engine";
 static const char *kNvsNamespace = "ir_signals";
+static const char *kNvsCacheNamespace = "ir_cache";
 static const char *kNvsKeyTable = "table";
 static constexpr uint32_t kSignalTableVersion = 2;
 static constexpr size_t kMaxSignals = 64;
@@ -65,6 +69,64 @@ static uint8_t s_pending_rx_source = 0;
 static uint16_t s_pending_quality = 0;
 static uint32_t s_noise_reject_count[kRxCount] = { 0 };
 static uint64_t s_noise_last_log_us[kRxCount] = { 0 };
+
+static signal_buffer_entry_t s_signal_buffer[SIGNAL_BUFFER_SIZE] = {};
+static uint32_t s_buffer_tick = 0;
+static SemaphoreHandle_t s_tx_mutex = nullptr;
+
+static size_t ticks_to_rmt_items(const uint16_t *ticks, size_t tick_count, rmt_item32_t *out_items, size_t max_items)
+{
+    const size_t item_count = (tick_count + 1U) / 2U;
+    if (item_count > max_items) {
+        return 0;
+    }
+    size_t tick_idx = 0;
+    for (size_t i = 0; i < item_count; ++i) {
+        out_items[i].level0 = 1;
+        out_items[i].duration0 = ticks[tick_idx++];
+        out_items[i].level1 = 0;
+        if (tick_idx < tick_count) {
+            out_items[i].duration1 = ticks[tick_idx++];
+        } else {
+            out_items[i].duration1 = 0;
+        }
+    }
+    return item_count;
+}
+
+static signal_buffer_entry_t *buffer_find_slot(uint32_t signal_id)
+{
+    // First check for existing entry
+    for (int i = 0; i < SIGNAL_BUFFER_SIZE; ++i) {
+        if (s_signal_buffer[i].valid && s_signal_buffer[i].signal_id == signal_id) {
+            return &s_signal_buffer[i];
+        }
+    }
+    // Find LRU slot (invalid slot first, then lowest last_used)
+    signal_buffer_entry_t *lru = nullptr;
+    for (int i = 0; i < SIGNAL_BUFFER_SIZE; ++i) {
+        if (!s_signal_buffer[i].valid) {
+            return &s_signal_buffer[i];
+        }
+        if (!lru || s_signal_buffer[i].last_used < lru->last_used) {
+            lru = &s_signal_buffer[i];
+        }
+    }
+    return lru;
+}
+
+const signal_buffer_entry_t *ir_engine_buffer_get_all(size_t *count)
+{
+    if (count) {
+        *count = SIGNAL_BUFFER_SIZE;
+    }
+    return s_signal_buffer;
+}
+
+static void make_binding_key(uint8_t slot_id, const char *suffix, char *out_key, size_t out_size)
+{
+    snprintf(out_key, out_size, "s%u_%s", static_cast<unsigned>(slot_id), suffix);
+}
 
 static void make_payload_key(uint32_t signal_id, char *out_key, size_t out_size)
 {
@@ -532,6 +594,17 @@ esp_err_t ir_engine_init()
     s_signal_table.next_signal_id = 1;
     s_signal_table.count = 0;
 
+    memset(s_signal_buffer, 0, sizeof(s_signal_buffer));
+    s_buffer_tick = 0;
+
+    if (!s_tx_mutex) {
+        s_tx_mutex = xSemaphoreCreateMutex();
+        if (!s_tx_mutex) {
+            ESP_LOGE(TAG, "Failed to create TX mutex");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
     esp_err_t err = signal_table_load();
     if (err != ESP_OK) {
         return err;
@@ -549,6 +622,8 @@ esp_err_t ir_engine_init()
         }
     }
 
+    ir_engine_load_buffer();
+
     ESP_LOGI(TAG, "IR engine initialized (signals=%lu, next_id=%lu)", static_cast<unsigned long>(s_signal_table.count),
              static_cast<unsigned long>(s_signal_table.next_signal_id));
     return ESP_OK;
@@ -565,60 +640,90 @@ esp_err_t ir_engine_send_signal(uint32_t signal_id, uint8_t slot_id, uint32_t cl
         return ESP_ERR_NOT_FOUND;
     }
 
-    const ir_signal_record_t *signal = find_signal(signal_id);
-    if (!signal) {
-        ESP_LOGW(TAG, "Signal %" PRIu32 " not found in NVS", signal_id);
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    if (signal->payload_len == 0 || signal->payload_len > (sizeof(s_pending_payload) / sizeof(s_pending_payload[0]))) {
-        ESP_LOGW(TAG, "Signal %" PRIu32 " has invalid payload_len=%u", signal_id, signal->payload_len);
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    uint16_t payload_ticks[128] = { 0 };
-    uint8_t loaded_len = 0;
-    esp_err_t load_err = load_signal_payload(signal_id, payload_ticks, sizeof(payload_ticks) / sizeof(payload_ticks[0]), &loaded_len);
-    if (load_err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to load payload for signal %" PRIu32 ": %s", signal_id, esp_err_to_name(load_err));
-        return load_err;
-    }
-    if (loaded_len == 0 || loaded_len != signal->payload_len) {
-        ESP_LOGW(TAG, "Payload length mismatch for signal %" PRIu32 " meta=%u actual=%u", signal_id, signal->payload_len,
-                 loaded_len);
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    rmt_item32_t items[64] = {};
-    const size_t item_count = (loaded_len + 1U) / 2U;
-    if (item_count > (sizeof(items) / sizeof(items[0]))) {
-        ESP_LOGE(TAG, "payload too long for TX buffer: %u", signal->payload_len);
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    uint8_t payload_index = 0;
-    for (size_t i = 0; i < item_count; ++i) {
-        items[i].level0 = 1;
-        items[i].duration0 = payload_ticks[payload_index++];
-        items[i].level1 = 0;
-        if (payload_index < loaded_len) {
-            items[i].duration1 = payload_ticks[payload_index++];
-        } else {
-            items[i].duration1 = 0;
+    // Look up in buffer
+    signal_buffer_entry_t *buf_entry = nullptr;
+    for (int i = 0; i < SIGNAL_BUFFER_SIZE; ++i) {
+        if (s_signal_buffer[i].valid && s_signal_buffer[i].signal_id == signal_id) {
+            buf_entry = &s_signal_buffer[i];
+            break;
         }
     }
 
-    uint8_t repeat = signal->repeat == 0 ? 1 : signal->repeat;
+    rmt_item32_t items[64] = {};
+    size_t item_count = 0;
+    uint32_t carrier_hz = 38000;
+    uint8_t repeat = 1;
+
+    if (buf_entry) {
+        buf_entry->last_used = ++s_buffer_tick;
+        item_count = buf_entry->item_count;
+        carrier_hz = buf_entry->carrier_hz;
+        repeat = buf_entry->repeat;
+        memcpy(items, buf_entry->items, item_count * sizeof(rmt_item32_t));
+    } else {
+        // Buffer miss: load from NVS signal store
+        const ir_signal_record_t *signal = find_signal(signal_id);
+        if (!signal) {
+            ESP_LOGW(TAG, "Signal %" PRIu32 " not found", signal_id);
+            return ESP_ERR_NOT_FOUND;
+        }
+        if (signal->payload_len == 0 || signal->payload_len > (sizeof(s_pending_payload) / sizeof(s_pending_payload[0]))) {
+            ESP_LOGW(TAG, "Signal %" PRIu32 " has invalid payload_len=%u", signal_id, signal->payload_len);
+            return ESP_ERR_INVALID_STATE;
+        }
+
+        uint16_t payload_ticks[128] = { 0 };
+        uint8_t loaded_len = 0;
+        esp_err_t load_err = load_signal_payload(signal_id, payload_ticks, sizeof(payload_ticks) / sizeof(payload_ticks[0]), &loaded_len);
+        if (load_err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to load payload for signal %" PRIu32 ": %s", signal_id, esp_err_to_name(load_err));
+            return load_err;
+        }
+        if (loaded_len == 0 || loaded_len != signal->payload_len) {
+            ESP_LOGW(TAG, "Payload length mismatch for signal %" PRIu32 " meta=%u actual=%u", signal_id, signal->payload_len, loaded_len);
+            return ESP_ERR_INVALID_STATE;
+        }
+
+        item_count = ticks_to_rmt_items(payload_ticks, loaded_len, items, sizeof(items) / sizeof(items[0]));
+        if (item_count == 0) {
+            ESP_LOGE(TAG, "payload too long for TX buffer: %u", loaded_len);
+            return ESP_ERR_INVALID_SIZE;
+        }
+
+        carrier_hz = signal->carrier_hz;
+        repeat = signal->repeat == 0 ? 1 : signal->repeat;
+
+        // Store in buffer
+        signal_buffer_entry_t *slot = buffer_find_slot(signal_id);
+        if (slot) {
+            slot->signal_id = signal_id;
+            slot->carrier_hz = carrier_hz;
+            slot->repeat = repeat;
+            slot->item_count = item_count;
+            slot->last_used = ++s_buffer_tick;
+            slot->valid = true;
+            memcpy(slot->items, items, item_count * sizeof(rmt_item32_t));
+        }
+    }
+
     if (repeat > kMaxRepeatCount) {
         ESP_LOGW(TAG, "Clamping repeat from %u to %u", repeat, kMaxRepeatCount);
         repeat = kMaxRepeatCount;
     }
 
+    // Convert carrier_hz to high/low tick counts (1 tick = 1us @ kRmtClkDiv=80)
+    const uint16_t c_period = (carrier_hz > 0) ? static_cast<uint16_t>(1000000U / carrier_hz) : 26U;
+    const uint16_t c_high = c_period / 3U;
+    const uint16_t c_low = static_cast<uint16_t>(c_period - c_high);
+
     status_led_notify_ir_tx();
 
+    xSemaphoreTake(s_tx_mutex, portMAX_DELAY);
+    rmt_set_tx_carrier(kTxChannel, true, c_high, c_low, RMT_CARRIER_LEVEL_HIGH);
     for (uint8_t i = 0; i < repeat; ++i) {
         esp_err_t err = rmt_write_items(kTxChannel, items, item_count, true);
         if (err != ESP_OK) {
+            xSemaphoreGive(s_tx_mutex);
             ESP_LOGE(TAG, "TX failed for signal_id=%" PRIu32 ": %s", signal_id, esp_err_to_name(err));
             return err;
         }
@@ -626,11 +731,11 @@ esp_err_t ir_engine_send_signal(uint32_t signal_id, uint8_t slot_id, uint32_t cl
             esp_rom_delay_us(kRepeatGapUs);
         }
     }
+    xSemaphoreGive(s_tx_mutex);
 
     ESP_LOGI(TAG,
-             "TX signal_id=%" PRIu32 " name=%s slot=%u cluster=0x%04" PRIx32 " attr=0x%04" PRIx32 " len=%u repeat=%u carrier=%lu",
-             signal_id, signal->name, slot_id, cluster_id, attribute_id, loaded_len, repeat,
-             static_cast<unsigned long>(signal->carrier_hz));
+             "TX signal_id=%" PRIu32 " slot=%u cluster=0x%04" PRIx32 " attr=0x%04" PRIx32 " items=%u repeat=%u carrier=%" PRIu32,
+             signal_id, slot_id, cluster_id, attribute_id, static_cast<unsigned>(item_count), repeat, carrier_hz);
     (void)val;
     return ESP_OK;
 }
@@ -831,4 +936,350 @@ esp_err_t ir_engine_delete_signal(uint32_t signal_id)
 
     ESP_LOGI(TAG, "Deleted signal id=%" PRIu32, signal_id);
     return ESP_OK;
+}
+
+// ---- Buffer public API ----
+
+const signal_buffer_entry_t *ir_engine_buffer_lookup(uint32_t signal_id)
+{
+    for (int i = 0; i < SIGNAL_BUFFER_SIZE; ++i) {
+        if (s_signal_buffer[i].valid && s_signal_buffer[i].signal_id == signal_id) {
+            return &s_signal_buffer[i];
+        }
+    }
+    return nullptr;
+}
+
+static void persist_buffer_to_nvs();
+
+void ir_engine_flush_buffer_to_nvs()
+{
+    persist_buffer_to_nvs();
+}
+
+static void persist_buffer_to_nvs()
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(kNvsCacheNamespace, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to open ir_cache for buffer persist: %s", esp_err_to_name(err));
+        return;
+    }
+
+    int persisted = 0;
+    for (int i = 0; i < SIGNAL_BUFFER_SIZE; ++i) {
+        const signal_buffer_entry_t &e = s_signal_buffer[i];
+        if (!e.valid || e.signal_id == 0) continue;
+
+        // Convert RMT items back to ticks for storage
+        uint16_t ticks[128];
+        size_t tick_count = 0;
+        for (size_t j = 0; j < e.item_count && tick_count < 126; ++j) {
+            ticks[tick_count++] = static_cast<uint16_t>(e.items[j].duration0);
+            ticks[tick_count++] = static_cast<uint16_t>(e.items[j].duration1);
+        }
+
+        // Try to read existing blob to preserve/increment ref_count
+        uint32_t existing_ref_count = 0;
+        char key[16];
+        snprintf(key, sizeof(key), "c%" PRIu32, e.signal_id);
+        {
+            size_t existing_size = 0;
+            if (nvs_get_blob(handle, key, nullptr, &existing_size) == ESP_OK &&
+                existing_size >= (4 + 4 + 1 + 2 + 4 + 8)) {
+                uint8_t existing_blob[4 + 4 + 1 + 2 + 4 + 8 + 128 * 2];
+                if (existing_size <= sizeof(existing_blob) &&
+                    nvs_get_blob(handle, key, existing_blob, &existing_size) == ESP_OK) {
+                    // ref_count is at offset 11 (after sig_id(4)+carrier(4)+repeat(1)+tc16(2))
+                    memcpy(&existing_ref_count, existing_blob + 11, 4);
+                }
+            }
+        }
+        uint32_t new_ref_count = existing_ref_count + 1;
+        int64_t now = static_cast<int64_t>(time(nullptr));
+
+        // New blob format: signal_id(4) + carrier_hz(4) + repeat(1) + tick_count(2) + ref_count(4) + last_seen_at(8) + ticks(N*2)
+        const size_t blob_size = 4 + 4 + 1 + 2 + 4 + 8 + tick_count * sizeof(uint16_t);
+        uint8_t blob[4 + 4 + 1 + 2 + 4 + 8 + 128 * 2];
+        size_t offset = 0;
+        uint32_t sig_id = e.signal_id;
+        uint32_t carr = e.carrier_hz;
+        uint8_t rep = e.repeat;
+        uint16_t tc16 = static_cast<uint16_t>(tick_count);
+        memcpy(blob + offset, &sig_id, 4);           offset += 4;
+        memcpy(blob + offset, &carr, 4);             offset += 4;
+        memcpy(blob + offset, &rep, 1);              offset += 1;
+        memcpy(blob + offset, &tc16, 2);             offset += 2;
+        memcpy(blob + offset, &new_ref_count, 4);    offset += 4;
+        memcpy(blob + offset, &now, 8);              offset += 8;
+        memcpy(blob + offset, ticks, tick_count * sizeof(uint16_t));
+
+        if (nvs_set_blob(handle, key, blob, blob_size) == ESP_OK) {
+            persisted++;
+        }
+    }
+
+    nvs_commit(handle);
+    nvs_close(handle);
+    ESP_LOGI(TAG, "Buffer full — persisted %d signals to NVS", persisted);
+}
+
+esp_err_t ir_engine_send_raw(uint32_t signal_id, uint32_t carrier_hz, uint8_t repeat, const uint16_t *ticks,
+                              size_t tick_count)
+{
+    if (!s_hw_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_learning.state == IR_LEARNING_IN_PROGRESS) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!ticks || tick_count == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // Safe copy to avoid Xtensa alignment fault on unaligned byte pointer
+    uint16_t local_ticks[128];
+    const size_t copy_count = tick_count < 128 ? tick_count : 128;
+    memcpy(local_ticks, ticks, copy_count * sizeof(uint16_t));
+
+    rmt_item32_t items[64] = {};
+    size_t item_count = 0;
+
+    // Check buffer
+    signal_buffer_entry_t *buf_entry = nullptr;
+    if (signal_id != 0) {
+        for (int i = 0; i < SIGNAL_BUFFER_SIZE; ++i) {
+            if (s_signal_buffer[i].valid && s_signal_buffer[i].signal_id == signal_id) {
+                buf_entry = &s_signal_buffer[i];
+                break;
+            }
+        }
+    }
+
+    if (buf_entry) {
+        buf_entry->last_used = ++s_buffer_tick;
+        item_count = buf_entry->item_count;
+        memcpy(items, buf_entry->items, item_count * sizeof(rmt_item32_t));
+    } else {
+        item_count = ticks_to_rmt_items(local_ticks, copy_count, items, sizeof(items) / sizeof(items[0]));
+        if (item_count == 0) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        // Store in buffer
+        if (signal_id != 0) {
+            signal_buffer_entry_t *slot = buffer_find_slot(signal_id);
+            if (slot) {
+                slot->signal_id = signal_id;
+                slot->carrier_hz = carrier_hz;
+                slot->repeat = repeat;
+                slot->item_count = item_count;
+                slot->last_used = ++s_buffer_tick;
+                slot->valid = true;
+                memcpy(slot->items, items, item_count * sizeof(rmt_item32_t));
+                // Check if buffer is full, persist to NVS if so
+                bool buffer_full = true;
+                for (int i = 0; i < SIGNAL_BUFFER_SIZE; ++i) {
+                    if (!s_signal_buffer[i].valid) { buffer_full = false; break; }
+                }
+                if (buffer_full) {
+                    persist_buffer_to_nvs();
+                }
+            }
+        }
+    }
+
+    uint8_t actual_repeat = repeat == 0 ? 1 : repeat;
+    if (actual_repeat > kMaxRepeatCount) {
+        actual_repeat = kMaxRepeatCount;
+    }
+
+    const uint16_t r_period = (carrier_hz > 0) ? static_cast<uint16_t>(1000000U / carrier_hz) : 26U;
+    const uint16_t r_high = r_period / 3U;
+    const uint16_t r_low = static_cast<uint16_t>(r_period - r_high);
+
+    status_led_notify_ir_tx();
+
+    xSemaphoreTake(s_tx_mutex, portMAX_DELAY);
+    rmt_set_tx_carrier(kTxChannel, true, r_high, r_low, RMT_CARRIER_LEVEL_HIGH);
+    for (uint8_t i = 0; i < actual_repeat; ++i) {
+        esp_err_t err = rmt_write_items(kTxChannel, items, item_count, true);
+        if (err != ESP_OK) {
+            xSemaphoreGive(s_tx_mutex);
+            ESP_LOGE(TAG, "TX raw failed signal_id=%" PRIu32 ": %s", signal_id, esp_err_to_name(err));
+            return err;
+        }
+        if (i + 1U < actual_repeat) {
+            esp_rom_delay_us(kRepeatGapUs);
+        }
+    }
+    xSemaphoreGive(s_tx_mutex);
+
+    ESP_LOGI(TAG, "TX raw signal_id=%" PRIu32 " items=%u repeat=%u carrier=%" PRIu32, signal_id,
+             static_cast<unsigned>(item_count), actual_repeat, carrier_hz);
+    return ESP_OK;
+}
+
+esp_err_t ir_engine_persist_binding(uint8_t slot_id, const char *binding_suffix, uint32_t signal_id,
+                                    uint32_t carrier_hz, uint8_t repeat, const uint16_t *ticks, size_t tick_count)
+{
+    if (!binding_suffix || !ticks || tick_count == 0 || tick_count > 128) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // Build blob: signal_id(4) + carrier_hz(4) + repeat(1) + tick_count(2) + ticks(tick_count*2)
+    const size_t blob_size = 4 + 4 + 1 + 2 + tick_count * sizeof(uint16_t);
+    uint8_t blob[4 + 4 + 1 + 2 + 128 * 2];
+    size_t offset = 0;
+    memcpy(blob + offset, &signal_id, 4);   offset += 4;
+    memcpy(blob + offset, &carrier_hz, 4);  offset += 4;
+    memcpy(blob + offset, &repeat, 1);      offset += 1;
+    uint16_t tc16 = static_cast<uint16_t>(tick_count);
+    memcpy(blob + offset, &tc16, 2);        offset += 2;
+    memcpy(blob + offset, ticks, tick_count * sizeof(uint16_t));
+
+    char key[16];
+    make_binding_key(slot_id, binding_suffix, key, sizeof(key));
+
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(kNvsCacheNamespace, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_set_blob(handle, key, blob, blob_size);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to persist binding key=%s: %s", key, esp_err_to_name(err));
+    }
+    return err;
+}
+
+static bool load_binding_blob(nvs_handle_t handle, const char *key)
+{
+    size_t blob_size = 0;
+    esp_err_t err = nvs_get_blob(handle, key, nullptr, &blob_size);
+    if (err != ESP_OK || blob_size < 11) {
+        return false;
+    }
+
+    // New format: sig_id(4)+carrier(4)+repeat(1)+tc16(2)+ref_count(4)+last_seen_at(8)+ticks(N*2) = 23+N*2 min
+    // Old format: sig_id(4)+carrier(4)+repeat(1)+tc16(2)+ticks(N*2) = 11+N*2 min
+    static constexpr size_t kNewHeaderSize = 4 + 4 + 1 + 2 + 4 + 8; // 23
+
+    uint8_t blob[4 + 4 + 1 + 2 + 4 + 8 + 128 * 2];
+    if (blob_size > sizeof(blob)) {
+        return false;
+    }
+    err = nvs_get_blob(handle, key, blob, &blob_size);
+    if (err != ESP_OK) {
+        return false;
+    }
+
+    size_t off = 0;
+    uint32_t sig_id, carr_hz;
+    uint8_t rep;
+    uint16_t tc16;
+    memcpy(&sig_id,  blob + off, 4); off += 4;
+    memcpy(&carr_hz, blob + off, 4); off += 4;
+    memcpy(&rep,     blob + off, 1); off += 1;
+    memcpy(&tc16,    blob + off, 2); off += 2;
+
+    // Determine format by checking if blob_size matches new vs old header
+    uint32_t ref_count = 0;
+    int64_t last_seen_at = 0;
+    bool is_new_format = (blob_size >= kNewHeaderSize + tc16 * sizeof(uint16_t));
+    if (is_new_format) {
+        memcpy(&ref_count,    blob + off, 4); off += 4;
+        memcpy(&last_seen_at, blob + off, 8); off += 8;
+    }
+
+    if (tc16 == 0 || tc16 > 128 || blob_size < off + tc16 * sizeof(uint16_t)) {
+        return false;
+    }
+
+    uint16_t ticks[128];
+    memcpy(ticks, blob + off, tc16 * sizeof(uint16_t));
+
+    rmt_item32_t items[64] = {};
+    size_t item_count = ticks_to_rmt_items(ticks, tc16, items, 64);
+    if (item_count == 0) {
+        return false;
+    }
+
+    signal_buffer_entry_t *slot_entry = buffer_find_slot(sig_id);
+    if (slot_entry) {
+        slot_entry->signal_id = sig_id;
+        slot_entry->carrier_hz = carr_hz;
+        slot_entry->repeat = rep;
+        slot_entry->item_count = item_count;
+        slot_entry->last_used = ++s_buffer_tick;
+        slot_entry->valid = true;
+        slot_entry->ref_count = ref_count;
+        slot_entry->last_seen_at = last_seen_at;
+        memcpy(slot_entry->items, items, item_count * sizeof(rmt_item32_t));
+        ESP_LOGD(TAG, "Loaded binding %s into buffer sig_id=%" PRIu32 " ref_count=%" PRIu32, key, sig_id, ref_count);
+    }
+    return true;
+}
+
+void ir_engine_load_buffer()
+{
+    static const char *kNewSuffixes[] = { "a", "b" };
+    static const char *kOldSuffixes[] = { "on", "off", "up", "down" };
+    static const uint8_t kMaxSlots = 8;
+
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(kNvsCacheNamespace, NVS_READWRITE, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to open ir_cache namespace: %s", esp_err_to_name(err));
+        return;
+    }
+
+    bool migrated_any = false;
+
+    for (uint8_t slot = 0; slot < kMaxSlots; ++slot) {
+        // Load new keys (a/b)
+        for (uint8_t si = 0; si < 2; ++si) {
+            char key[16];
+            make_binding_key(slot, kNewSuffixes[si], key, sizeof(key));
+            load_binding_blob(handle, key);
+        }
+
+        // Migrate old keys (on/off/up/down) → erase after loading
+        for (uint8_t si = 0; si < 4; ++si) {
+            char key[16];
+            make_binding_key(slot, kOldSuffixes[si], key, sizeof(key));
+            if (load_binding_blob(handle, key)) {
+                nvs_erase_key(handle, key);
+                migrated_any = true;
+                ESP_LOGI(TAG, "Migrated and erased legacy key: %s", key);
+            }
+        }
+    }
+
+    if (migrated_any) {
+        nvs_commit(handle);
+    }
+
+    // Load persisted signals by signal_id (c{id} keys)
+    // Read slot configs to find which signal_ids to load
+    size_t slot_count = 0;
+    const bridge_slot_state_t *slots = bridge_action_get_slots(&slot_count);
+    for (size_t i = 0; i < slot_count; ++i) {
+        uint32_t sids[2] = { slots[i].signal_id_a, slots[i].signal_id_b };
+        for (int j = 0; j < 2; ++j) {
+            if (sids[j] == 0) continue;
+            char ckey[16];
+            snprintf(ckey, sizeof(ckey), "c%" PRIu32, sids[j]);
+            load_binding_blob(handle, ckey);
+        }
+    }
+
+    nvs_close(handle);
+    ESP_LOGI(TAG, "ir_engine_load_buffer done tick=%lu", static_cast<unsigned long>(s_buffer_tick));
 }

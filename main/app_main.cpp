@@ -10,6 +10,7 @@
 #include <esp_event.h>
 #include <esp_log.h>
 #include <esp_netif_ip_addr.h>
+#include <esp_sntp.h>
 #include <nvs_flash.h>
 
 #include <freertos/FreeRTOS.h>
@@ -174,6 +175,12 @@ static void on_ip_event(void *arg, esp_event_base_t event_base, int32_t event_id
 
     const auto *ip_event = static_cast<const ip_event_got_ip_t *>(event_data);
     ESP_LOGI(TAG, "Web UI ready (IP): http://" IPSTR, IP2STR(&ip_event->ip_info.ip));
+
+    esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_init();
+    ESP_LOGI(TAG, "SNTP initialized, syncing time from pool.ntp.org");
+
     esp_err_t err = app_local_discovery_start(80, &ip_event->ip_info.ip);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "mDNS start deferred (IP_EVENT_STA_GOT_IP): %s", esp_err_to_name(err));

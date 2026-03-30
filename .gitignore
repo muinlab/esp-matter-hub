@@ -33,3 +33,6 @@ __pycache__/
 # Local development state
 .omc/
 .claude/
+
+# Credentials (never commit)
+.wifi_credentials

@@ -5,7 +5,9 @@
 
 #include <esp_http_server.h>
 #include <esp_log.h>
-#include <esp_timer.h>
+#include <esp_random.h>
+#include <esp_system.h>
+#include <nvs.h>
 
 #include "bridge_action.h"
 #include "ir_engine.h"
@@ -15,7 +17,66 @@
 
 static const char *TAG = "web_server";
 static httpd_handle_t s_server = nullptr;
+static char s_api_key[17] = {};
 extern "C" esp_err_t app_open_commissioning_window(uint16_t timeout_seconds);
+
+static const char *kNvsNamespaceWeb = "web_config";
+static const char *kNvsKeyApiKey = "api_key";
+
+static void save_api_key_to_nvs()
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(kNvsNamespaceWeb, NVS_READWRITE, &handle);
+    if (err != ESP_OK) return;
+    nvs_set_str(handle, kNvsKeyApiKey, s_api_key);
+    nvs_commit(handle);
+    nvs_close(handle);
+}
+
+static void generate_api_key()
+{
+    // Try loading from NVS first
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(kNvsNamespaceWeb, NVS_READONLY, &handle);
+    if (err == ESP_OK) {
+        size_t len = sizeof(s_api_key);
+        err = nvs_get_str(handle, kNvsKeyApiKey, s_api_key, &len);
+        nvs_close(handle);
+        if (err == ESP_OK && s_api_key[0] != '\0') {
+            ESP_LOGI(TAG, "API Key loaded from NVS (persistent)");
+            ESP_LOGW(TAG, "========================================");
+            ESP_LOGW(TAG, "  Web API Key: %s", s_api_key);
+            ESP_LOGW(TAG, "========================================");
+            return;
+        }
+    }
+
+    // Generate new random key and save
+    uint32_t r0 = esp_random();
+    uint32_t r1 = esp_random();
+    snprintf(s_api_key, sizeof(s_api_key), "%08lx%08lx",
+             static_cast<unsigned long>(r0), static_cast<unsigned long>(r1));
+    save_api_key_to_nvs();
+    ESP_LOGW(TAG, "========================================");
+    ESP_LOGW(TAG, "  Web API Key: %s (new, saved to NVS)", s_api_key);
+    ESP_LOGW(TAG, "========================================");
+}
+
+static bool check_api_key(httpd_req_t *req)
+{
+    char key_buf[20] = {};
+    esp_err_t err = httpd_req_get_hdr_value_str(req, "X-Api-Key", key_buf, sizeof(key_buf));
+    if (err == ESP_OK && strcmp(key_buf, s_api_key) == 0) {
+        return true;
+    }
+    httpd_resp_set_status(req, "401 Unauthorized");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"error\":\"invalid or missing X-Api-Key\"}");
+    return false;
+}
+
+static bool parse_u32_field(const char *json, const char *field_name, uint32_t *out_value);
+static bool parse_string_field(const char *json, const char *field_name, char *out_value, size_t out_size);
 
 static esp_err_t register_uri_handler_checked(httpd_handle_t server, const httpd_uri_t *uri)
 {
@@ -33,69 +94,125 @@ static const char *kDashboardHtml =
     ".card{background:#fff;border-radius:12px;padding:16px;margin-bottom:16px;box-shadow:0 2px 10px rgba(0,0,0,.06)}"
     "button{padding:8px 12px;border:0;border-radius:8px;background:#0a84ff;color:#fff;cursor:pointer}"
     "button:disabled{background:#98a2b3;cursor:not-allowed}"
-    "input,select{padding:8px;border:1px solid #cfd6dd;border-radius:8px;margin-right:8px}"
+    "button.sm{padding:4px 8px;font-size:12px;background:#dc3545}"
+    "input{padding:8px;border:1px solid #cfd6dd;border-radius:8px;margin-right:8px}"
     "table{width:100%;border-collapse:collapse}th,td{padding:8px;border-bottom:1px solid #e9edf0;text-align:left}"
-    ".row{display:flex;gap:8px;flex-wrap:wrap}.muted{color:#667085;font-size:13px}.pill{display:inline-block;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:600}.pill.wait{background:#fff4ce;color:#7a5d00}.pill.ok{background:#dcfce7;color:#166534}.pill.err{background:#fee2e2;color:#991b1b}.pulse{animation:pulse .7s ease-in-out}@keyframes pulse{0%{transform:scale(1)}50%{transform:scale(1.06)}100%{transform:scale(1)}}</style></head><body>"
-    "<h1>ESP Matter Hub</h1>"
-    "<div class='card'><h3>Learn</h3><div class='row'>"
-    "<input id='timeoutSec' type='number' value='15' min='1' step='1'/>"
-    "<button id='startLearnBtn' onclick='startLearn()'>Start Learning</button>"
-    "<input id='signalName' placeholder='signal name'/>"
-    "<input id='deviceType' placeholder='device type (tv/ac/etc)'/>"
-    "<button onclick='commitLearn()'>Commit Learned Signal</button>"
-    "<button onclick='refreshStatus()'>Refresh Status</button>"
+    ".row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}"
+    ".muted{color:#667085;font-size:13px}"
+    ".pill{display:inline-block;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:600}"
+    ".pill.wait{background:#fff4ce;color:#7a5d00}.pill.ok{background:#dcfce7;color:#166534}.pill.err{background:#fee2e2;color:#991b1b}"
+    ".sys{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px}"
+    ".sys div{background:#f9fafb;padding:8px 12px;border-radius:8px}.sys .label{font-size:11px;color:#667085}.sys .val{font-size:18px;font-weight:600}"
+    ".cache-bar{display:flex;gap:2px;margin:8px 0}.buf-slot{width:24px;height:24px;border-radius:4px;background:#e9edf0;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:600}"
+    ".buf-slot.used{background:#0a84ff;color:#fff}"
+    ".pulse{animation:pulse .7s ease-in-out}@keyframes pulse{0%{transform:scale(1)}50%{transform:scale(1.06)}100%{transform:scale(1)}}"
+    "</style></head><body>"
+    "<h1>ESP Matter Hub <span class='muted' style='font-size:14px'>v3.1</span></h1>"
+
+    "<div class='card' id='authCard'><h3>API Key</h3><div class='row'>"
+    "<input id='apiKey' type='password' placeholder='enter key from serial console' style='width:240px'/>"
+    "<button onclick='verifyKey()'>Unlock</button>"
+    "<span id='authStatus' class='muted'></span></div>"
+    "<p class='muted'>Enter the API key shown in serial log on boot to unlock the dashboard.</p></div>"
+
+    "<div id='mainContent' style='display:none'>"
+
+    "<div class='card'><h3>System</h3><div class='sys' id='sysInfo'><div><div class='label'>Status</div><div class='val'>-</div></div></div></div>"
+
+    "<div class='card'><h3>Signal Buffer</h3>"
+    "<p class='muted'>App sends IR data via Matter (SendSignalWithRaw). Hub buffers for fast replay. Persisted to NVS when full.</p>"
+    "<div id='bufferBar' class='cache-bar'></div>"
+    "<p id='bufferInfo' class='muted'>-</p>"
+    "<table><thead><tr><th>#</th><th>Signal ID</th><th>Carrier</th><th>Repeat</th><th>Items</th></tr></thead><tbody id='cache'></tbody></table></div>"
+
+    "<div class='card'><h3>Endpoint Slots</h3>"
+    "<p class='muted'>Configure button type and signal mapping per slot.</p>"
+    "<button onclick='refreshSlots()'>Refresh</button>"
+    "<table><thead><tr><th>Slot</th><th>EP</th><th>Type</th><th>Name</th><th id='thA'>Signal A</th><th id='thB'>Signal B</th><th></th></tr></thead><tbody id='slots'></tbody></table></div>"
+
+    "<div class='card'><h3>IR Learn</h3><div class='row'>"
+    "<input id='timeoutSec' type='number' value='15' min='1' step='1' style='width:60px'/>"
+    "<button id='startLearnBtn' onclick='startLearn()'>Start</button>"
     "</div><p id='status' class='muted'>-</p><p id='captureHint' class='pill wait'>Idle</p></div>"
-    "<div class='card'><h3>Signals</h3><button onclick='refreshSignals()'>Refresh Signals</button>"
-    "<table><thead><tr><th>ID</th><th>Name</th><th>Type</th><th>Carrier</th><th>Repeat</th><th>Payload</th><th>Action</th></tr></thead><tbody id='signals'></tbody></table></div>"
-    "<div class='card'><h3>Endpoint Slots (fixed: 0~7)</h3><button onclick='refreshSlots()'>Refresh Slots</button>"
-    "<table><thead><tr><th>Slot</th><th>Role</th><th>Endpoint</th><th>Device ID</th><th>Display Name</th><th>On</th><th>Off</th><th>Level Up</th><th>Level Down</th></tr></thead><tbody id='slots'></tbody></table></div>"
-    "<div class='card'><h3>Bind Signal to Slot</h3><div class='row'>"
-    "<select id='slot'></select>"
-    "<select id='onSignalId'><option value='0'>On: Unbind (0)</option></select>"
-    "<select id='offSignalId'><option value='0'>Off: Unbind (0)</option></select>"
-    "<select id='levelUpSignalId'><option value='0'>Level Up: Unbind (0)</option></select>"
-    "<select id='levelDownSignalId'><option value='0'>Level Down: Unbind (0)</option></select>"
-    "<button onclick='bindSignal()'>Bind</button></div><p id='bindResult' class='muted'>-</p><p id='bindSlotInfo' class='muted'>-</p></div>"
-    "<div class='card'><h3>Devices (light)</h3><div class='row'>"
-    "<input id='deviceName' placeholder='device name'/>"
-    "<button onclick='registerDevice()'>Register Device</button>"
-    "</div><p id='deviceResult' class='muted'>-</p><table><thead><tr><th>ID</th><th>Name</th><th>Type</th><th>Rename</th></tr></thead><tbody id='devices'></tbody></table></div>"
-    "<div class='card'><h3>Endpoint Assignment</h3><div class='row'>"
-    "<select id='assignSlot'></select>"
-    "<select id='assignDeviceId'><option value='0'>Unassign (0)</option></select>"
-    "<button onclick='assignDevice()'>Assign</button></div><p id='assignResult' class='muted'>-</p></div>"
+
+    "<div class='card'><h3>Persisted Signals</h3>"
+    "<p class='muted'>Signals currently in the buffer (persisted to NVS when evicted).</p>"
+    "<table><thead><tr><th>Signal ID</th><th>Carrier</th><th>Repeat</th><th>Ref Count</th><th>Last Seen</th><th>Items</th></tr></thead><tbody id='persisted'></tbody></table></div>"
+
+    "</div>"
     "<script>"
-    "let lastSignalId=0,slots=[],signals=[],devices=[],lastCaptureKey='';"
-    "async function j(url,opt){const r=await fetch(url,opt);return [r.status,await r.json().catch(()=>({}))];}"
+    "function getKey(){return sessionStorage.getItem('apiKey')||'';}"
+    "async function verifyKey(){const k=document.getElementById('apiKey').value;if(!k){document.getElementById('authStatus').textContent='Key required';return;}"
+    "sessionStorage.setItem('apiKey',k);"
+    "const r=await fetch('/api/health');if(r.status===200){unlockUI();}else{document.getElementById('authStatus').textContent='Verifying...';unlockUI();}}"
+    "function unlockUI(){document.getElementById('mainContent').style.display='';document.getElementById('authCard').style.display='none';initDashboard();}"
+    "if(getKey()){document.getElementById('apiKey').value=getKey();unlockUI();}"
+    "async function j(u,o){o=o||{};o.headers=o.headers||{};const k=getKey();if(k)o.headers['X-Api-Key']=k;const r=await fetch(u,o);return[r.status,await r.json().catch(()=>({}))];}"
+
+    "async function refreshSys(){const [s,d]=await j('/api/health');if(s!==200)return;"
+    "const el=document.getElementById('sysInfo');"
+    "el.innerHTML=`<div><div class='label'>Status</div><div class='val'>${d.status}</div></div>"
+    "<div><div class='label'>Slots</div><div class='val'>${d.slots}</div></div>"
+    "<div><div class='label'>Heap Free</div><div class='val'>${d.heap_free?Math.round(d.heap_free/1024)+'K':'-'}</div></div>"
+    "<div><div class='label'>Heap Min</div><div class='val'>${d.heap_min?Math.round(d.heap_min/1024)+'K':'-'}</div></div>"
+    "<div><div class='label'>mDNS</div><div class='val'>${d.mdns}</div></div>"
+    "<div><div class='label'>LED</div><div class='val'>${d.led_state}</div></div>"
+    "<div><div class='label'>Hostname</div><div class='val' style='font-size:12px'>${d.fqdn||'-'}</div></div>`;}"
+
+    "async function refreshBuffer(){const [s,d]=await j('/api/buffer');if(s!==200)return;const entries=d.entries||[];"
+    "const used=entries.filter(e=>e.valid).length;document.getElementById('bufferInfo').textContent=`${used}/${entries.length} buffered`;"
+    "const bar=document.getElementById('bufferBar');bar.innerHTML='';for(let i=0;i<entries.length;i++){const e=entries[i];"
+    "const div=document.createElement('div');div.className='buf-slot'+(e.valid?' used':'');div.textContent=e.valid?e.signal_id:'';div.title=e.valid?`sig=${e.signal_id} carrier=${e.carrier_hz} items=${e.item_count}`:'empty';bar.appendChild(div);}"
+    "const t=document.getElementById('cache');t.innerHTML='';for(const e of entries){if(!e.valid)continue;const tr=document.createElement('tr');"
+    "tr.innerHTML=`<td>${entries.indexOf(e)}</td><td>${e.signal_id}</td><td>${e.carrier_hz}</td><td>${e.repeat}</td><td>${e.item_count}</td>`;t.appendChild(tr);}"
+    "const pt=document.getElementById('persisted');pt.innerHTML='';for(const e of entries){if(!e.valid)continue;const tr=document.createElement('tr');"
+    "const ls=e.last_seen_at>0?new Date(e.last_seen_at).toLocaleString():'-';"
+    "tr.innerHTML=`<td>${e.signal_id}</td><td>${e.carrier_hz}</td><td>${e.repeat}</td><td>${e.ref_count||0}</td><td>${ls}</td><td>${e.item_count}</td>`;pt.appendChild(tr);}}"
+
+    "const BT=['ONOFF','LEVEL','ONLYON'];"
+    "const LBL_A=['ON','UP','Signal'];const LBL_B=['OFF','DOWN',''];"
+    "async function refreshSlots(){const [s,d]=await j('/api/slots');const list=d.slots||[];"
+    "const t=document.getElementById('slots');t.innerHTML='';for(const x of list){const tr=document.createElement('tr');"
+    "const sel=BT.map((n,i)=>`<option value='${i}'${i===x.button_type?' selected':''}>${n}</option>`).join('');"
+    "const showB=(x.button_type!==2);const hideBs=showB?'display:inline':'display:none';const hideBl=showB?'display:inline-block':'display:none';"
+    "const la=LBL_A[x.button_type]||'A';const lb=LBL_B[x.button_type]||'B';const lblW='display:inline-block;width:70px;font-size:12px';"
+    "tr.innerHTML=`<td>${x.slot_id}</td><td>${x.endpoint_id}</td>"
+    "<td><select id='bt-${x.slot_id}' onchange='onBtChange(${x.slot_id})'>${sel}</select></td>"
+    "<td><input id='dn-${x.slot_id}' value='${x.display_name||''}' style='width:100px'/></td>"
+    "<td><span id='la-${x.slot_id}' style='${lblW}'>${la}</span><input id='sa-${x.slot_id}' type='number' min='0' value='${x.signal_id_a}' style='width:70px'/></td>"
+    "<td><span id='lb-${x.slot_id}' style='${lblW};${hideBl}'>${lb}</span><input id='sb-${x.slot_id}' type='number' min='0' value='${x.signal_id_b}' style='width:70px;${hideBs}'/></td>"
+    "<td><button onclick='saveSlot(${x.slot_id})'>Save</button></td>`;t.appendChild(tr);}}"
+    "function onBtChange(id){const v=Number(document.getElementById('bt-'+id).value);"
+    "const la=document.getElementById('la-'+id);const lb=document.getElementById('lb-'+id);"
+    "const sb=document.getElementById('sb-'+id);"
+    "la.textContent=LBL_A[v]||'A';"
+    "lb.textContent=LBL_B[v]||'B';"
+    "sb.style.display=(v===2)?'none':'inline';"
+    "lb.style.display=(v===2)?'none':'inline-block';}"
+    "async function saveSlot(id){const bt=Number(document.getElementById('bt-'+id).value);"
+    "const sa=Number(document.getElementById('sa-'+id).value)||0;const sb=Number(document.getElementById('sb-'+id).value)||0;"
+    "const dn=document.getElementById('dn-'+id).value;"
+    "const [s,d]=await j('/api/slots/'+id+'/config',{method:'POST',headers:{'Content-Type':'application/json'},"
+    "body:JSON.stringify({button_type:bt,signal_id_a:sa,signal_id_b:sb,display_name:dn})});"
+    "if(s===200){await refreshSlots();}else{alert('Error: '+JSON.stringify(d));}}"
+
+    "let lastCaptureKey='';"
     "async function refreshStatus(){const [s,d]=await j('/api/learn/status');"
-    "const b=document.getElementById('startLearnBtn');if(b){b.disabled=(d.state==='in_progress');}"
-    "lastSignalId=d.last_signal_id||0;const timeoutSec=((d.timeout_ms||0)/1000).toFixed(1);document.getElementById('status').textContent=`HTTP ${s} | state=${d.state} elapsed=${d.elapsed_ms}ms timeout=${timeoutSec}s last_signal_id=${lastSignalId} rx_source=${d.rx_source||0} captured_len=${d.captured_len||0} quality_score=${d.quality_score||0}`;"
-    "const h=document.getElementById('captureHint');if(d.state==='in_progress'){h.className='pill wait';h.textContent='Listening... press remote button';}else if(d.state==='ready'&&(d.captured_len||0)>0){const key=`${d.rx_source||0}-${d.captured_len||0}-${d.quality_score||0}`;h.className='pill ok';h.textContent=`Captured! RX${d.rx_source||0}, len=${d.captured_len||0}`;if(lastCaptureKey!==key){h.classList.add('pulse');setTimeout(()=>h.classList.remove('pulse'),700);lastCaptureKey=key;}}else if(d.state==='failed'){h.className='pill err';h.textContent='Learning timeout. Try again';}else{h.className='pill wait';h.textContent='Idle';}}"
-    "async function startLearn(){const timeout_s=Number(document.getElementById('timeoutSec').value)||15;"
-    "const [s,d]=await j('/api/learn/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({timeout_s})});"
-    "document.getElementById('status').textContent=`HTTP ${s} | ${JSON.stringify(d)}`;const b=document.getElementById('startLearnBtn');if(b){b.disabled=(s===200);}document.getElementById('captureHint').className='pill wait';document.getElementById('captureHint').textContent='Listening... press remote button';setTimeout(refreshStatus,300);}"
-    "async function commitLearn(){const name=document.getElementById('signalName').value||'';const device_type=document.getElementById('deviceType').value||'';"
-    "const [s,d]=await j('/api/learn/commit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,device_type})});"
-    "document.getElementById('status').textContent=`HTTP ${s} | ${JSON.stringify(d)}`;await refreshStatus();await refreshSignals();}"
-    "function syncSignalSelect(){const ids=['onSignalId','offSignalId','levelUpSignalId','levelDownSignalId'];for(const id of ids){const sel=document.getElementById(id);if(!sel)continue;const cur=Number(sel.value)||0;sel.innerHTML='';const base=document.createElement('option');base.value='0';base.textContent=id==='onSignalId'?'On: Unbind (0)':id==='offSignalId'?'Off: Unbind (0)':id==='levelUpSignalId'?'Level Up: Unbind (0)':'Level Down: Unbind (0)';sel.appendChild(base);for(const x of signals){const o=document.createElement('option');o.value=String(x.signal_id);o.textContent=`${x.signal_id}: ${x.name||'-'} (${x.device_type||'-'})`;sel.appendChild(o);}sel.value=String(signals.some(x=>x.signal_id===cur)?cur:0);}const dsel=document.getElementById('assignDeviceId');if(dsel){const cur=Number(dsel.value)||0;dsel.innerHTML='';const z=document.createElement('option');z.value='0';z.textContent='Unassign (0)';dsel.appendChild(z);for(const d of devices){const o=document.createElement('option');o.value=String(d.device_id);o.textContent=`${d.device_id}: ${d.name}`;dsel.appendChild(o);}dsel.value=String(devices.some(d=>d.device_id===cur)?cur:0);}}"
-    "function syncSlotSelects(){const ids=['slot','assignSlot'];for(const id of ids){const sel=document.getElementById(id);if(!sel)continue;const cur=Number(sel.value)||0;sel.innerHTML='';for(const x of slots){const o=document.createElement('option');o.value=String(x.slot_id);const n=(x.display_name&&x.display_name.length>0)?x.display_name:`Slot ${x.slot_id}`;o.textContent=`Slot ${x.slot_id} (${n})`;sel.appendChild(o);}if(slots.length===0){const o=document.createElement('option');o.value='0';o.textContent='Slot 0';sel.appendChild(o);}sel.value=String(slots.some(x=>x.slot_id===cur)?cur:(slots[0]?slots[0].slot_id:0));}updateBindSlotInfo();}"
-    "function updateBindSlotInfo(){const slotId=Number(document.getElementById('slot').value)||0;const x=slots.find(s=>s.slot_id===slotId);const el=document.getElementById('bindSlotInfo');if(!el)return;if(!x){el.textContent='-';return;}el.textContent=`slot=${x.slot_id} endpoint=${x.endpoint_id} device=${x.device_id||0} name=${x.display_name||'-'}`;}"
-    "async function refreshSignals(){const [s,d]=await j('/api/signals');const list=d.signals||[];signals=list;"
-    "const t=document.getElementById('signals');t.innerHTML='';for(const x of list){const tr=document.createElement('tr');"
-    "tr.innerHTML=`<td>${x.signal_id}</td><td>${x.name}</td><td>${x.device_type}</td><td>${x.carrier_hz}</td><td>${x.repeat}</td><td>${x.payload_len||0}</td><td><button onclick='deleteSignal(${x.signal_id})'>Delete</button></td>`;t.appendChild(tr);}syncSignalSelect();if(s!==200){document.getElementById('status').textContent=`signals error HTTP ${s}`;}}"
-    "async function refreshSlots(){const [s,d]=await j('/api/slots');slots=d.slots||[];"
-    "const t=document.getElementById('slots');t.innerHTML='';for(const x of slots){const tr=document.createElement('tr');"
-    "tr.innerHTML=`<td>${x.slot_id}</td><td>${x.role||'-'}</td><td>${x.endpoint_id}</td><td>${x.device_id||0}</td><td>${x.display_name||'-'}</td><td>${x.on_signal_id}</td><td>${x.off_signal_id}</td><td>${x.level_up_signal_id}</td><td>${x.level_down_signal_id}</td>`;t.appendChild(tr);}syncSlotSelects();if(s!==200){document.getElementById('bindResult').textContent=`slots error HTTP ${s}`;}}"
-    "async function refreshDevices(){const [s,d]=await j('/api/devices');devices=d.devices||[];const t=document.getElementById('devices');t.innerHTML='';for(const x of devices){const tr=document.createElement('tr');tr.innerHTML=`<td>${x.device_id}</td><td>${x.name}</td><td>${x.device_type}</td><td><input id='rename-${x.device_id}' placeholder='new name' style='max-width:140px'/><button onclick='renameDevice(${x.device_id})'>Rename</button></td>`;t.appendChild(tr);}if(s!==200){document.getElementById('deviceResult').textContent=`devices error HTTP ${s}`;}syncSignalSelect();}"
-    "async function renameDevice(deviceId){const e=document.getElementById(`rename-${deviceId}`);const name=(e&&e.value)||'';const [s,d]=await j(`/api/devices/${deviceId}/rename`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});document.getElementById('deviceResult').textContent=`HTTP ${s} | ${JSON.stringify(d)}`;await refreshDevices();await refreshSlots();}"
-    "async function registerDevice(){const name=document.getElementById('deviceName').value||'';const [s,d]=await j('/api/devices/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,device_type:'light'})});document.getElementById('deviceResult').textContent=`HTTP ${s} | ${JSON.stringify(d)}`;await refreshDevices();}"
-    "async function assignDevice(){const slotId=Number(document.getElementById('assignSlot').value)||0;const deviceId=Number(document.getElementById('assignDeviceId').value)||0;const [s,d]=await j(`/api/endpoints/${slotId}/assign`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({device_id:deviceId})});document.getElementById('assignResult').textContent=`HTTP ${s} | ${JSON.stringify(d)}`;await refreshSlots();}"
-    "async function bindSignal(){const slotId=Number(document.getElementById('slot').value);"
-    "const on=Number(document.getElementById('onSignalId').value)||0;const off=Number(document.getElementById('offSignalId').value)||0;const levelUp=Number(document.getElementById('levelUpSignalId').value)||0;const levelDown=Number(document.getElementById('levelDownSignalId').value)||0;"
-    "const [s,d]=await j(`/api/slots/${slotId}/bind`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({on_signal_id:on,off_signal_id:off,level_up_signal_id:levelUp,level_down_signal_id:levelDown})});"
-    "document.getElementById('bindResult').textContent=`HTTP ${s} | ${JSON.stringify(d)}`;await refreshSlots();}"
-    "async function deleteSignal(signalId){if(!confirm(`Delete signal ${signalId}?`))return;const [s,d]=await j(`/api/signals/${signalId}`,{method:'DELETE'});document.getElementById('status').textContent=`HTTP ${s} | ${JSON.stringify(d)}`;await refreshSignals();await refreshDevices();await refreshSlots();}"
-    "document.getElementById('slot').addEventListener('change',updateBindSlotInfo);refreshStatus();refreshSignals();refreshDevices();refreshSlots();setInterval(refreshStatus,1000);</script></body></html>";
+    "const b=document.getElementById('startLearnBtn');if(b)b.disabled=(d.state==='in_progress');"
+    "document.getElementById('status').textContent=`state=${d.state} elapsed=${d.elapsed_ms}ms captured_len=${d.captured_len||0} quality=${d.quality_score||0}`;"
+    "const h=document.getElementById('captureHint');"
+    "if(d.state==='in_progress'){h.className='pill wait';h.textContent='Listening...';}"
+    "else if(d.state==='ready'&&(d.captured_len||0)>0){const key=`${d.rx_source}-${d.captured_len}-${d.quality_score}`;h.className='pill ok';h.textContent=`Captured! len=${d.captured_len}`;if(lastCaptureKey!==key){h.classList.add('pulse');setTimeout(()=>h.classList.remove('pulse'),700);lastCaptureKey=key;}}"
+    "else if(d.state==='failed'){h.className='pill err';h.textContent='Timeout';}"
+    "else{h.className='pill wait';h.textContent='Idle';}}"
+
+    "async function startLearn(){const t=Number(document.getElementById('timeoutSec').value)||15;"
+    "const [s,d]=await j('/api/learn/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({timeout_s:t})});"
+    "document.getElementById('captureHint').className='pill wait';document.getElementById('captureHint').textContent='Listening...';setTimeout(refreshStatus,300);}"
+
+    "function initDashboard(){refreshSys();refreshBuffer();refreshSlots();refreshStatus();"
+    "setInterval(refreshStatus,1000);setInterval(()=>{refreshSys();refreshBuffer();},5000);}"
+    "</script></body></html>";
 
 static esp_err_t send_json(httpd_req_t *req, const char *json)
 {
@@ -136,11 +253,55 @@ static esp_err_t health_get_handler(httpd_req_t *req)
     const char *mdns_state = app_local_discovery_ready() ? "ready" : "disabled";
     const char *led_state = status_led_get_state_str();
 
-    char body[320];
+    char body[384];
     snprintf(body, sizeof(body),
-             "{\"status\":\"ok\",\"service\":\"esp-matter-hub\",\"slots\":%u,\"hostname\":\"%s\",\"fqdn\":\"%s\",\"mdns\":\"%s\",\"led_state\":\"%s\"}",
-             static_cast<unsigned>(slot_count), hostname, fqdn, mdns_state, led_state);
+             "{\"status\":\"ok\",\"service\":\"esp-matter-hub\",\"slots\":%u,\"hostname\":\"%s\",\"fqdn\":\"%s\",\"mdns\":\"%s\",\"led_state\":\"%s\","
+             "\"heap_free\":%lu,\"heap_min\":%lu}",
+             static_cast<unsigned>(slot_count), hostname, fqdn, mdns_state, led_state,
+             static_cast<unsigned long>(esp_get_free_heap_size()),
+             static_cast<unsigned long>(esp_get_minimum_free_heap_size()));
     return send_json(req, body);
+}
+
+static esp_err_t buffer_get_handler(httpd_req_t *req)
+{
+    size_t count = 0;
+    const signal_buffer_entry_t *entries = ir_engine_buffer_get_all(&count);
+
+    esp_err_t err = begin_json_stream(req);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = httpd_resp_sendstr_chunk(req, "{\"entries\":[");
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    char item[192];
+    for (size_t i = 0; i < count; ++i) {
+        const signal_buffer_entry_t &e = entries[i];
+        snprintf(item, sizeof(item),
+                 "%s{\"valid\":%s,\"signal_id\":%lu,\"carrier_hz\":%lu,\"repeat\":%u,\"item_count\":%u,\"ref_count\":%lu,\"last_seen_at\":%lld}",
+                 (i == 0) ? "" : ",",
+                 e.valid ? "true" : "false",
+                 static_cast<unsigned long>(e.signal_id),
+                 static_cast<unsigned long>(e.carrier_hz),
+                 e.repeat,
+                 static_cast<unsigned>(e.item_count),
+                 static_cast<unsigned long>(e.ref_count),
+                 static_cast<long long>(e.last_seen_at));
+        err = httpd_resp_sendstr_chunk(req, item);
+        if (err != ESP_OK) {
+            return err;
+        }
+    }
+
+    err = httpd_resp_sendstr_chunk(req, "]}");
+    if (err != ESP_OK) {
+        return err;
+    }
+    return end_json_stream(req);
 }
 
 static esp_err_t slots_get_handler(httpd_req_t *req)
@@ -158,16 +319,16 @@ static esp_err_t slots_get_handler(httpd_req_t *req)
         return err;
     }
 
-    char item[320];
+    char item[256];
     for (size_t i = 0; i < slot_count; ++i) {
         const bridge_slot_state_t &slot = slots[i];
-        const char *role = bridge_action_get_slot_role(slot.slot_id);
         snprintf(item, sizeof(item),
-                 "%s{\"slot_id\":%u,\"role\":\"%s\",\"endpoint_id\":%u,\"device_id\":%lu,\"display_name\":\"%s\",\"on_signal_id\":%lu,\"off_signal_id\":%lu,\"level_up_signal_id\":%lu,\"level_down_signal_id\":%lu}",
-                 (i == 0) ? "" : ",", slot.slot_id, role, slot.endpoint_id,
-                 static_cast<unsigned long>(slot.assigned_device_id), slot.display_name,
-                 static_cast<unsigned long>(slot.on_signal_id), static_cast<unsigned long>(slot.off_signal_id),
-                 static_cast<unsigned long>(slot.level_up_signal_id), static_cast<unsigned long>(slot.level_down_signal_id));
+                 "%s{\"slot_id\":%u,\"endpoint_id\":%u,\"button_type\":%u,\"button_type_name\":\"%s\","
+                 "\"display_name\":\"%s\",\"signal_id_a\":%lu,\"signal_id_b\":%lu}",
+                 (i == 0) ? "" : ",", slot.slot_id, slot.endpoint_id,
+                 static_cast<unsigned>(slot.button_type), bridge_action_button_type_name(slot.button_type),
+                 slot.display_name,
+                 static_cast<unsigned long>(slot.signal_id_a), static_cast<unsigned long>(slot.signal_id_b));
         err = httpd_resp_sendstr_chunk(req, item);
         if (err != ESP_OK) {
             return err;
@@ -184,110 +345,87 @@ static esp_err_t slots_get_handler(httpd_req_t *req)
 static bool parse_slot_id_from_uri(const char *uri, uint8_t *slot_id)
 {
     const char *prefix = "/api/slots/";
-    const char *suffix = "/bind";
     size_t prefix_len = strlen(prefix);
-    size_t uri_len = strlen(uri);
-    size_t suffix_len = strlen(suffix);
-
-    if (!uri || !slot_id || uri_len <= (prefix_len + suffix_len)) {
+    if (!uri || !slot_id || strncmp(uri, prefix, prefix_len) != 0) {
         return false;
     }
-    if (strncmp(uri, prefix, prefix_len) != 0) {
-        return false;
-    }
-    if (strcmp(uri + uri_len - suffix_len, suffix) != 0) {
-        return false;
-    }
-
-    const char *slot_str = uri + prefix_len;
-    char *end = nullptr;
-    long slot = strtol(slot_str, &end, 10);
-    if (end == slot_str || strncmp(end, suffix, suffix_len) != 0 || slot < 0 || slot > 255) {
-        return false;
-    }
-
-    *slot_id = static_cast<uint8_t>(slot);
-    return true;
-}
-
-static bool parse_endpoint_slot_from_uri(const char *uri, uint8_t *slot_id)
-{
-    const char *prefix = "/api/endpoints/";
-    const char *suffix = "/assign";
-    size_t prefix_len = strlen(prefix);
-    size_t uri_len = strlen(uri);
-    size_t suffix_len = strlen(suffix);
-
-    if (!uri || !slot_id || uri_len <= (prefix_len + suffix_len)) {
-        return false;
-    }
-    if (strncmp(uri, prefix, prefix_len) != 0) {
-        return false;
-    }
-    if (strcmp(uri + uri_len - suffix_len, suffix) != 0) {
-        return false;
-    }
-
-    const char *slot_str = uri + prefix_len;
-    char *end = nullptr;
-    long slot = strtol(slot_str, &end, 10);
-    if (end == slot_str || strncmp(end, suffix, suffix_len) != 0 || slot < 0 || slot > 255) {
-        return false;
-    }
-    *slot_id = static_cast<uint8_t>(slot);
-    return true;
-}
-
-static bool parse_device_id_from_uri(const char *uri, uint32_t *device_id)
-{
-    const char *prefix = "/api/devices/";
-    const char *suffix = "/rename";
-    size_t prefix_len = strlen(prefix);
-    size_t uri_len = strlen(uri);
-    size_t suffix_len = strlen(suffix);
-
-    if (!uri || !device_id || uri_len <= (prefix_len + suffix_len)) {
-        return false;
-    }
-    if (strncmp(uri, prefix, prefix_len) != 0) {
-        return false;
-    }
-    if (strcmp(uri + uri_len - suffix_len, suffix) != 0) {
-        return false;
-    }
-
     const char *id_str = uri + prefix_len;
     char *end = nullptr;
     unsigned long id = strtoul(id_str, &end, 10);
-    if (end == id_str || strncmp(end, suffix, suffix_len) != 0) {
+    if (end == id_str || id > 255) {
         return false;
     }
-    *device_id = static_cast<uint32_t>(id);
+    *slot_id = static_cast<uint8_t>(id);
     return true;
 }
 
-static bool parse_signal_id_from_uri(const char *uri, uint32_t *signal_id)
+static esp_err_t api_key_post_handler(httpd_req_t *req)
 {
-    const char *prefix = "/api/signals/";
-    size_t prefix_len = strlen(prefix);
+    if (!check_api_key(req)) { return ESP_OK; }
 
-    if (!uri || !signal_id || strncmp(uri, prefix, prefix_len) != 0) {
-        return false;
+    if (req->content_len == 0 || req->content_len >= 128) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid body");
     }
 
-    const char *id_str = uri + prefix_len;
-    if (*id_str == '\0') {
-        return false;
+    char body[128];
+    int read_len = httpd_req_recv(req, body, req->content_len);
+    if (read_len <= 0) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body");
+    }
+    body[read_len] = '\0';
+
+    char new_key[20] = {};
+    parse_string_field(body, "key", new_key, sizeof(new_key));
+    if (strlen(new_key) < 4) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "key must be at least 4 characters");
     }
 
-    char *end = nullptr;
-    unsigned long id = strtoul(id_str, &end, 10);
-    if (end == id_str || *end != '\0' || id == 0 || id > UINT32_MAX) {
-        return false;
+    strlcpy(s_api_key, new_key, sizeof(s_api_key));
+    save_api_key_to_nvs();
+    ESP_LOGI(TAG, "API key updated and saved to NVS");
+    return send_json(req, "{\"status\":\"ok\",\"message\":\"API key updated\"}");
+}
+
+static esp_err_t slot_config_post_handler(httpd_req_t *req)
+{
+    if (!check_api_key(req)) { return ESP_OK; }
+
+    uint8_t slot_id = 0;
+    if (!parse_slot_id_from_uri(req->uri, &slot_id)) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid slot URI");
     }
 
-    *signal_id = static_cast<uint32_t>(id);
-    return true;
+    if (req->content_len == 0 || req->content_len >= 256) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid body");
+    }
+
+    char body[256];
+    int read_len = httpd_req_recv(req, body, req->content_len);
+    if (read_len <= 0) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body");
+    }
+    body[read_len] = '\0';
+
+    uint32_t type_val = 0, sig_a = 0, sig_b = 0;
+    parse_u32_field(body, "button_type", &type_val);
+    parse_u32_field(body, "signal_id_a", &sig_a);
+    parse_u32_field(body, "signal_id_b", &sig_b);
+
+    char display_name[40] = {};
+    parse_string_field(body, "display_name", display_name, sizeof(display_name));
+
+    esp_err_t err = bridge_action_configure_slot(slot_id, static_cast<button_type_t>(type_val), sig_a, sig_b,
+                                                  display_name[0] ? display_name : nullptr);
+    if (err == ESP_ERR_INVALID_ARG) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid slot_id or button_type");
+    }
+    if (err != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "failed to configure slot");
+    }
+
+    char response[128];
+    snprintf(response, sizeof(response), "{\"status\":\"ok\",\"slot_id\":%u}", slot_id);
+    return send_json(req, response);
 }
 
 static bool parse_u32_field(const char *json, const char *field_name, uint32_t *out_value)
@@ -355,193 +493,9 @@ static bool parse_string_field(const char *json, const char *field_name, char *o
     return true;
 }
 
-static bool query_scope_enabled(const char *scope, const char *target)
-{
-    if (!scope || strcmp(scope, "all") == 0) {
-        return true;
-    }
-    return strcmp(scope, target) == 0;
-}
-
-static esp_err_t export_nvs_get_handler(httpd_req_t *req)
-{
-    char scope[24] = "all";
-    char query[96];
-    if (httpd_req_get_url_query_len(req) > 0 && httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
-        char scope_param[24] = { 0 };
-        if (httpd_query_key_value(query, "scope", scope_param, sizeof(scope_param)) == ESP_OK && scope_param[0] != '\0') {
-            strlcpy(scope, scope_param, sizeof(scope));
-        }
-    }
-
-    bool include_signals = query_scope_enabled(scope, "signals");
-    bool include_bindings = query_scope_enabled(scope, "bindings");
-    bool include_devices = query_scope_enabled(scope, "devices");
-
-    if (!include_signals && !include_bindings && !include_devices) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid scope");
-    }
-
-    const ir_signal_record_t *signals = nullptr;
-    size_t signal_count = 0;
-    if (include_signals) {
-        esp_err_t err = ir_engine_get_signals(&signals, &signal_count);
-        if (err != ESP_OK) {
-            return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "failed to read signals");
-        }
-    }
-
-    static constexpr size_t kPayloadCap = 128;
-    uint16_t *payload_pool = nullptr;
-    uint8_t *payload_lens = nullptr;
-    if (include_signals && signal_count > 0) {
-        payload_pool = static_cast<uint16_t *>(malloc(signal_count * kPayloadCap * sizeof(uint16_t)));
-        payload_lens = static_cast<uint8_t *>(malloc(signal_count));
-        if (!payload_pool || !payload_lens) {
-            free(payload_pool);
-            free(payload_lens);
-            return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "export memory allocation failed");
-        }
-
-        for (size_t i = 0; i < signal_count; ++i) {
-            uint16_t *payload = payload_pool + (i * kPayloadCap);
-            uint8_t payload_len = 0;
-            esp_err_t err = ir_engine_get_signal_payload(signals[i].signal_id, payload, kPayloadCap, &payload_len);
-            if (err != ESP_OK || payload_len != signals[i].payload_len) {
-                free(payload_pool);
-                free(payload_lens);
-                httpd_resp_set_status(req, "500 Internal Server Error");
-                char body[192];
-                snprintf(body, sizeof(body),
-                         "{\"status\":\"error\",\"code\":\"EXPORT_PAYLOAD_INTEGRITY_FAILED\",\"signal_id\":%lu}",
-                         static_cast<unsigned long>(signals[i].signal_id));
-                return send_json(req, body);
-            }
-            payload_lens[i] = payload_len;
-        }
-    }
-
-    size_t binding_count = 0;
-    const bridge_slot_state_t *bindings = nullptr;
-    if (include_bindings) {
-        bindings = bridge_action_get_slots(&binding_count);
-    }
-
-    uint64_t exported_at_unix = static_cast<uint64_t>(esp_timer_get_time() / 1000000ULL);
-    const char *hostname = app_local_discovery_hostname();
-
-    httpd_resp_set_type(req, "application/json");
-    esp_err_t send_err = httpd_resp_sendstr_chunk(req, "{");
-    if (send_err != ESP_OK) {
-        goto cleanup;
-    }
-
-    char head[256];
-    snprintf(head, sizeof(head),
-             "\"schema_version\":1,\"board_id\":\"%s\",\"exported_at_unix\":%llu,\"scope\":\"%s\",",
-             hostname ? hostname : "", static_cast<unsigned long long>(exported_at_unix), scope);
-    send_err = httpd_resp_sendstr_chunk(req, head);
-    if (send_err != ESP_OK) {
-        goto cleanup;
-    }
-
-    char counts[128];
-    snprintf(counts, sizeof(counts), "\"counts\":{\"signals\":%u,\"bindings\":%u,\"devices\":0},",
-             static_cast<unsigned>(include_signals ? signal_count : 0), static_cast<unsigned>(include_bindings ? binding_count : 0));
-    send_err = httpd_resp_sendstr_chunk(req, counts);
-    if (send_err != ESP_OK) {
-        goto cleanup;
-    }
-
-    send_err = httpd_resp_sendstr_chunk(req, "\"signals\":[");
-    if (send_err != ESP_OK) {
-        goto cleanup;
-    }
-    if (include_signals) {
-        for (size_t i = 0; i < signal_count; ++i) {
-            char item[320];
-            int n = snprintf(item, sizeof(item),
-                             "%s{\"signal_id\":%lu,\"name\":\"%s\",\"device_type\":\"%s\",\"carrier_hz\":%lu,\"repeat\":%u,\"payload_len\":%u,\"payload_ticks\":[",
-                             (i == 0) ? "" : ",", static_cast<unsigned long>(signals[i].signal_id), signals[i].name,
-                             signals[i].device_type, static_cast<unsigned long>(signals[i].carrier_hz), signals[i].repeat,
-                             payload_lens[i]);
-            if (n <= 0 || n >= static_cast<int>(sizeof(item))) {
-                send_err = ESP_ERR_INVALID_SIZE;
-                goto cleanup;
-            }
-            send_err = httpd_resp_send_chunk(req, item, n);
-            if (send_err != ESP_OK) {
-                goto cleanup;
-            }
-
-            uint16_t *payload = payload_pool + (i * kPayloadCap);
-            for (uint8_t p = 0; p < payload_lens[i]; ++p) {
-                char tick[24];
-                int tick_n = snprintf(tick, sizeof(tick), "%s%u", (p == 0) ? "" : ",", payload[p]);
-                if (tick_n <= 0 || tick_n >= static_cast<int>(sizeof(tick))) {
-                    send_err = ESP_ERR_INVALID_SIZE;
-                    goto cleanup;
-                }
-                send_err = httpd_resp_send_chunk(req, tick, tick_n);
-                if (send_err != ESP_OK) {
-                    goto cleanup;
-                }
-            }
-            send_err = httpd_resp_sendstr_chunk(req, "]}");
-            if (send_err != ESP_OK) {
-                goto cleanup;
-            }
-        }
-    }
-    send_err = httpd_resp_sendstr_chunk(req, "],");
-    if (send_err != ESP_OK) {
-        goto cleanup;
-    }
-
-    send_err = httpd_resp_sendstr_chunk(req, "\"bindings\":[");
-    if (send_err != ESP_OK) {
-        goto cleanup;
-    }
-    if (include_bindings) {
-        for (size_t i = 0; i < binding_count; ++i) {
-            char item[256];
-            int n = snprintf(item, sizeof(item),
-                             "%s{\"slot_id\":%u,\"endpoint_id\":%u,\"role\":\"%s\",\"on_signal_id\":%lu,\"off_signal_id\":%lu,\"level_up_signal_id\":%lu,\"level_down_signal_id\":%lu}",
-                             (i == 0) ? "" : ",", bindings[i].slot_id, bindings[i].endpoint_id,
-                             bridge_action_get_slot_role(bindings[i].slot_id), static_cast<unsigned long>(bindings[i].on_signal_id),
-                             static_cast<unsigned long>(bindings[i].off_signal_id),
-                             static_cast<unsigned long>(bindings[i].level_up_signal_id),
-                             static_cast<unsigned long>(bindings[i].level_down_signal_id));
-            if (n <= 0 || n >= static_cast<int>(sizeof(item))) {
-                send_err = ESP_ERR_INVALID_SIZE;
-                goto cleanup;
-            }
-            send_err = httpd_resp_send_chunk(req, item, n);
-            if (send_err != ESP_OK) {
-                goto cleanup;
-            }
-        }
-    }
-    send_err = httpd_resp_sendstr_chunk(req, "],");
-    if (send_err != ESP_OK) {
-        goto cleanup;
-    }
-
-    send_err = httpd_resp_sendstr_chunk(req, include_devices ? "\"devices\":[]}" : "\"devices\":[]}");
-    if (send_err != ESP_OK) {
-        goto cleanup;
-    }
-
-    send_err = httpd_resp_send_chunk(req, nullptr, 0);
-
-cleanup:
-    free(payload_pool);
-    free(payload_lens);
-    return send_err;
-}
-
 static esp_err_t commissioning_open_post_handler(httpd_req_t *req)
 {
+    if (!check_api_key(req)) { return ESP_OK; }
     uint32_t timeout_s = 300;
     if (req->content_len > 0 && req->content_len < 128) {
         char body[128];
@@ -564,196 +518,9 @@ static esp_err_t commissioning_open_post_handler(httpd_req_t *req)
     return send_json(req, response);
 }
 
-static esp_err_t slot_bind_post_handler(httpd_req_t *req)
-{
-    uint8_t slot_id = 0;
-    if (!parse_slot_id_from_uri(req->uri, &slot_id)) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid slot URI");
-    }
-
-    if (req->content_len <= 0 || req->content_len > 255) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid body length");
-    }
-
-    char body[256];
-    int read_len = httpd_req_recv(req, body, req->content_len);
-    if (read_len <= 0) {
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "failed to read request body");
-    }
-    body[read_len] = '\0';
-
-    uint32_t on_signal_id = 0;
-    uint32_t off_signal_id = 0;
-    uint32_t level_up_signal_id = 0;
-    uint32_t level_down_signal_id = 0;
-    if (!parse_u32_field(body, "on_signal_id", &on_signal_id) ||
-        !parse_u32_field(body, "off_signal_id", &off_signal_id) ||
-        !parse_u32_field(body, "level_up_signal_id", &level_up_signal_id) ||
-        !parse_u32_field(body, "level_down_signal_id", &level_down_signal_id)) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing signal id fields");
-    }
-
-    esp_err_t err = bridge_action_bind_slot(slot_id, on_signal_id, off_signal_id, level_up_signal_id, level_down_signal_id);
-    if (err != ESP_OK) {
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "failed to save slot binding");
-    }
-
-    char response[220];
-    snprintf(response, sizeof(response),
-             "{\"status\":\"ok\",\"slot_id\":%u,\"on_signal_id\":%lu,\"off_signal_id\":%lu,\"level_up_signal_id\":%lu,\"level_down_signal_id\":%lu}",
-             slot_id, static_cast<unsigned long>(on_signal_id), static_cast<unsigned long>(off_signal_id),
-             static_cast<unsigned long>(level_up_signal_id), static_cast<unsigned long>(level_down_signal_id));
-    return send_json(req, response);
-}
-
-static esp_err_t devices_get_handler(httpd_req_t *req)
-{
-    size_t count = 0;
-    const bridge_device_t *devices = bridge_action_get_devices(&count);
-
-    esp_err_t err = begin_json_stream(req);
-    if (err != ESP_OK) {
-        return err;
-    }
-    err = httpd_resp_sendstr_chunk(req, "{\"devices\":[");
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    char item[320];
-    for (size_t i = 0; i < count; ++i) {
-        snprintf(item, sizeof(item),
-                 "%s{\"device_id\":%lu,\"name\":\"%s\",\"device_type\":\"%s\",\"on_signal_id\":%lu,\"off_signal_id\":%lu,\"level_up_signal_id\":%lu,\"level_down_signal_id\":%lu}",
-                 (i == 0) ? "" : ",", static_cast<unsigned long>(devices[i].device_id), devices[i].name,
-                 devices[i].device_type, static_cast<unsigned long>(devices[i].on_signal_id),
-                 static_cast<unsigned long>(devices[i].off_signal_id), static_cast<unsigned long>(devices[i].level_up_signal_id),
-                 static_cast<unsigned long>(devices[i].level_down_signal_id));
-        err = httpd_resp_sendstr_chunk(req, item);
-        if (err != ESP_OK) {
-            return err;
-        }
-    }
-
-    err = httpd_resp_sendstr_chunk(req, "]}");
-    if (err != ESP_OK) {
-        return err;
-    }
-    return end_json_stream(req);
-}
-
-static esp_err_t device_register_post_handler(httpd_req_t *req)
-{
-    if (req->content_len <= 0 || req->content_len > 255) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid body length");
-    }
-    char body[256];
-    int read_len = httpd_req_recv(req, body, req->content_len);
-    if (read_len <= 0) {
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "failed to read request body");
-    }
-    body[read_len] = '\0';
-
-    char name[40] = { 0 };
-    char device_type[16] = { 0 };
-    if (!parse_string_field(body, "name", name, sizeof(name))) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing name");
-    }
-    parse_string_field(body, "device_type", device_type, sizeof(device_type));
-    if (device_type[0] == '\0') {
-        strlcpy(device_type, "light", sizeof(device_type));
-    }
-
-    uint32_t device_id = 0;
-    esp_err_t err = bridge_action_register_device(name, device_type, &device_id);
-    if (err == ESP_ERR_NO_MEM) {
-        httpd_resp_set_status(req, "409 Conflict");
-        return send_json(req, "{\"status\":\"error\",\"message\":\"device capacity reached\"}");
-    }
-    if (err != ESP_OK) {
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "failed to register device");
-    }
-
-    char response[192];
-    snprintf(response, sizeof(response),
-             "{\"status\":\"ok\",\"device_id\":%lu,\"reboot_required\":false}", static_cast<unsigned long>(device_id));
-    return send_json(req, response);
-}
-
-static esp_err_t endpoint_assign_post_handler(httpd_req_t *req)
-{
-    uint8_t slot_id = 0;
-    if (!parse_endpoint_slot_from_uri(req->uri, &slot_id)) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid endpoint URI");
-    }
-
-    if (req->content_len <= 0 || req->content_len > 128) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid body length");
-    }
-    char body[128];
-    int read_len = httpd_req_recv(req, body, req->content_len);
-    if (read_len <= 0) {
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "failed to read request body");
-    }
-    body[read_len] = '\0';
-
-    uint32_t device_id = 0;
-    if (!parse_u32_field(body, "device_id", &device_id)) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing device_id");
-    }
-
-    esp_err_t err = bridge_action_assign_slot(slot_id, device_id);
-    if (err == ESP_ERR_NOT_FOUND) {
-        return httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "device not found");
-    }
-    if (err != ESP_OK) {
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "failed to assign endpoint");
-    }
-
-    char response[160];
-    snprintf(response, sizeof(response), "{\"status\":\"ok\",\"slot_id\":%u,\"device_id\":%lu}", slot_id,
-             static_cast<unsigned long>(device_id));
-    return send_json(req, response);
-}
-
-static esp_err_t device_rename_post_handler(httpd_req_t *req)
-{
-    uint32_t device_id = 0;
-    if (!parse_device_id_from_uri(req->uri, &device_id)) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid device URI");
-    }
-
-    if (req->content_len <= 0 || req->content_len > 255) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid body length");
-    }
-
-    char body[256];
-    int read_len = httpd_req_recv(req, body, req->content_len);
-    if (read_len <= 0) {
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "failed to read request body");
-    }
-    body[read_len] = '\0';
-
-    char name[40] = { 0 };
-    if (!parse_string_field(body, "name", name, sizeof(name)) || name[0] == '\0') {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing name");
-    }
-
-    esp_err_t err = bridge_action_rename_device(device_id, name);
-    if (err == ESP_ERR_NOT_FOUND) {
-        return httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "device not found");
-    }
-    if (err != ESP_OK) {
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "failed to rename device");
-    }
-
-    char response[192];
-    snprintf(response, sizeof(response), "{\"status\":\"ok\",\"device_id\":%lu,\"name\":\"%s\"}",
-             static_cast<unsigned long>(device_id), name);
-    return send_json(req, response);
-}
-
 static esp_err_t learn_start_post_handler(httpd_req_t *req)
 {
+    if (!check_api_key(req)) { return ESP_OK; }
     uint32_t timeout_ms = 15000;
     if (req->content_len > 0 && req->content_len < 128) {
         char body[128];
@@ -783,6 +550,7 @@ static esp_err_t learn_start_post_handler(httpd_req_t *req)
 
 static esp_err_t learn_commit_post_handler(httpd_req_t *req)
 {
+    if (!check_api_key(req)) { return ESP_OK; }
     char name[48] = { 0 };
     char device_type[24] = { 0 };
 
@@ -847,74 +615,13 @@ static esp_err_t learn_status_get_handler(httpd_req_t *req)
     return send_json(req, response);
 }
 
-static esp_err_t signals_get_handler(httpd_req_t *req)
-{
-    const ir_signal_record_t *signals = nullptr;
-    size_t count = 0;
-    esp_err_t err = ir_engine_get_signals(&signals, &count);
-    if (err != ESP_OK) {
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "failed to read signals");
-    }
-
-    httpd_resp_set_type(req, "application/json");
-    esp_err_t send_err = httpd_resp_sendstr_chunk(req, "{\"signals\":[");
-    if (send_err != ESP_OK) {
-        return send_err;
-    }
-
-    for (size_t i = 0; i < count; ++i) {
-        const ir_signal_record_t &sig = signals[i];
-        char item[256];
-        int n = snprintf(item, sizeof(item),
-                         "%s{\"signal_id\":%lu,\"name\":\"%s\",\"device_type\":\"%s\",\"carrier_hz\":%lu,\"repeat\":%u,\"payload_len\":%u}",
-                         (i == 0) ? "" : ",", static_cast<unsigned long>(sig.signal_id), sig.name, sig.device_type,
-                         static_cast<unsigned long>(sig.carrier_hz), sig.repeat, sig.payload_len);
-        if (n <= 0 || n >= static_cast<int>(sizeof(item))) {
-            return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "signals item too large");
-        }
-        send_err = httpd_resp_send_chunk(req, item, n);
-        if (send_err != ESP_OK) {
-            return send_err;
-        }
-    }
-
-    send_err = httpd_resp_sendstr_chunk(req, "]}");
-    if (send_err != ESP_OK) {
-        return send_err;
-    }
-    return httpd_resp_send_chunk(req, nullptr, 0);
-}
-
-static esp_err_t signal_delete_handler(httpd_req_t *req)
-{
-    uint32_t signal_id = 0;
-    if (!parse_signal_id_from_uri(req->uri, &signal_id)) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid signal URI");
-    }
-
-    esp_err_t unbind_err = bridge_action_unbind_signal_references(signal_id);
-    if (unbind_err != ESP_OK) {
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "failed to clear signal bindings");
-    }
-
-    esp_err_t err = ir_engine_delete_signal(signal_id);
-    if (err == ESP_ERR_NOT_FOUND) {
-        return httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "signal not found");
-    }
-    if (err != ESP_OK) {
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "failed to delete signal");
-    }
-
-    char response[128];
-    snprintf(response, sizeof(response), "{\"status\":\"ok\",\"signal_id\":%lu}", static_cast<unsigned long>(signal_id));
-    return send_json(req, response);
-}
-
 esp_err_t app_web_server_start()
 {
     if (s_server) {
         return ESP_OK;
     }
+
+    generate_api_key();
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
@@ -946,17 +653,6 @@ esp_err_t app_web_server_start()
         .user_ctx = nullptr,
     };
     err = register_uri_handler_checked(s_server, &slots_uri);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    const httpd_uri_t slots_bind_uri = {
-        .uri = "/api/slots/?*",
-        .method = HTTP_POST,
-        .handler = slot_bind_post_handler,
-        .user_ctx = nullptr,
-    };
-    err = register_uri_handler_checked(s_server, &slots_bind_uri);
     if (err != ESP_OK) {
         return err;
     }
@@ -994,79 +690,35 @@ esp_err_t app_web_server_start()
         return err;
     }
 
-    const httpd_uri_t signals_uri = {
-        .uri = "/api/signals",
+    const httpd_uri_t cache_uri = {
+        .uri = "/api/buffer",
         .method = HTTP_GET,
-        .handler = signals_get_handler,
+        .handler = buffer_get_handler,
         .user_ctx = nullptr,
     };
-    err = register_uri_handler_checked(s_server, &signals_uri);
+    err = register_uri_handler_checked(s_server, &cache_uri);
     if (err != ESP_OK) {
         return err;
     }
 
-    const httpd_uri_t signal_delete_uri = {
-        .uri = "/api/signals/*",
-        .method = HTTP_DELETE,
-        .handler = signal_delete_handler,
-        .user_ctx = nullptr,
-    };
-    err = register_uri_handler_checked(s_server, &signal_delete_uri);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    const httpd_uri_t devices_uri = {
-        .uri = "/api/devices",
-        .method = HTTP_GET,
-        .handler = devices_get_handler,
-        .user_ctx = nullptr,
-    };
-    err = register_uri_handler_checked(s_server, &devices_uri);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    const httpd_uri_t device_register_uri = {
-        .uri = "/api/devices/register",
+    const httpd_uri_t api_key_uri = {
+        .uri = "/api/key",
         .method = HTTP_POST,
-        .handler = device_register_post_handler,
+        .handler = api_key_post_handler,
         .user_ctx = nullptr,
     };
-    err = register_uri_handler_checked(s_server, &device_register_uri);
+    err = register_uri_handler_checked(s_server, &api_key_uri);
     if (err != ESP_OK) {
         return err;
     }
 
-    const httpd_uri_t device_rename_uri = {
-        .uri = "/api/devices/*",
+    const httpd_uri_t slot_config_uri = {
+        .uri = "/api/slots/*",
         .method = HTTP_POST,
-        .handler = device_rename_post_handler,
+        .handler = slot_config_post_handler,
         .user_ctx = nullptr,
     };
-    err = register_uri_handler_checked(s_server, &device_rename_uri);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    const httpd_uri_t endpoint_assign_uri = {
-        .uri = "/api/endpoints/*",
-        .method = HTTP_POST,
-        .handler = endpoint_assign_post_handler,
-        .user_ctx = nullptr,
-    };
-    err = register_uri_handler_checked(s_server, &endpoint_assign_uri);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    const httpd_uri_t export_nvs_uri = {
-        .uri = "/api/export/nvs",
-        .method = HTTP_GET,
-        .handler = export_nvs_get_handler,
-        .user_ctx = nullptr,
-    };
-    err = register_uri_handler_checked(s_server, &export_nvs_uri);
+    err = register_uri_handler_checked(s_server, &slot_config_uri);
     if (err != ESP_OK) {
         return err;
     }
@@ -1127,6 +779,6 @@ esp_err_t app_web_server_start()
     }
 
     ESP_LOGI(TAG,
-             "HTTP API started: GET /, GET /api/health, GET /api/slots, GET /api/signals, DELETE /api/signals/{id}, GET /api/devices, GET /api/export/nvs, POST /api/devices/register, POST /api/devices/{id}/rename, POST /api/endpoints/{slot}/assign, POST /api/slots/{id}/bind, POST /api/learn/start, GET /api/learn/status, POST /api/learn/commit, POST /api/commissioning/open");
+             "HTTP API started: GET /, /api/health, /api/slots, /api/buffer, POST /api/slots/*/config, /api/learn/*, /api/commissioning/open");
     return ESP_OK;
 }
