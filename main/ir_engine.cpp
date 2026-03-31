@@ -446,15 +446,9 @@ esp_err_t ir_engine_send_signal(uint32_t signal_id, uint8_t slot_id, uint32_t cl
         repeat = kMaxRepeatCount;
     }
 
-    // Convert carrier_hz to high/low tick counts (1 tick = 1us @ kRmtClkDiv=80)
-    const uint16_t c_period = (carrier_hz > 0) ? static_cast<uint16_t>(1000000U / carrier_hz) : 26U;
-    const uint16_t c_high = c_period / 3U;
-    const uint16_t c_low = static_cast<uint16_t>(c_period - c_high);
-
     status_led_notify_ir_tx();
 
     xSemaphoreTake(s_tx_mutex, portMAX_DELAY);
-    rmt_set_tx_carrier(kTxChannel, true, c_high, c_low, RMT_CARRIER_LEVEL_HIGH);
     for (uint8_t i = 0; i < repeat; ++i) {
         esp_err_t err = rmt_write_items(kTxChannel, items, item_count, true);
         if (err != ESP_OK) {
@@ -764,14 +758,9 @@ esp_err_t ir_engine_send_raw(uint32_t signal_id, uint32_t carrier_hz, uint8_t re
         actual_repeat = kMaxRepeatCount;
     }
 
-    const uint16_t r_period = (carrier_hz > 0) ? static_cast<uint16_t>(1000000U / carrier_hz) : 26U;
-    const uint16_t r_high = r_period / 3U;
-    const uint16_t r_low = static_cast<uint16_t>(r_period - r_high);
-
     status_led_notify_ir_tx();
 
     xSemaphoreTake(s_tx_mutex, portMAX_DELAY);
-    rmt_set_tx_carrier(kTxChannel, true, r_high, r_low, RMT_CARRIER_LEVEL_HIGH);
     for (uint8_t i = 0; i < actual_repeat; ++i) {
         esp_err_t err = rmt_write_items(kTxChannel, items, item_count, true);
         if (err != ESP_OK) {
