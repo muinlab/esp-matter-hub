@@ -134,9 +134,6 @@ static const char *kDashboardHtml =
     "<textarea id='lrTicks' readonly style='width:100%;height:48px;font-size:11px;font-family:monospace;background:#f9fafb;border:1px solid #cfd6dd;border-radius:6px;padding:6px;resize:none'></textarea>"
     "</div></div>"
 
-    "<div class='card'><h3>Persisted Signals</h3>"
-    "<p class='muted'>Signals stored in NVS. Use DumpNVS (Matter command) to refresh this list.</p>"
-    "<table><thead><tr><th>Signal ID</th><th>Carrier</th><th>Repeat</th><th>Ref Count</th><th>Last Seen</th></tr></thead><tbody id='persisted'></tbody></table></div>"
 
     "</div>"
     "<script>"
@@ -219,12 +216,10 @@ static const char *kDashboardHtml =
     "const [s,d]=await j('/api/learn/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({timeout_s:t})});"
     "document.getElementById('captureHint').className='pill wait';document.getElementById('captureHint').textContent='Listening...';setTimeout(refreshStatus,300);}"
 
-    "async function refreshPersisted(){const r=await fetch('/api/nvs/signals');if(r.status!==200)return;const list=await r.json();"
-    "const t=document.getElementById('persisted');t.innerHTML='';for(const e of list){const tr=document.createElement('tr');"
     "const hist=(e.history||[]).map(ts=>ts>0?new Date(ts*1000).toLocaleString():'-').join(', ')||'-';"
     "tr.innerHTML=`<td>${e.signal_id}</td><td>${e.carrier_hz}</td><td>${e.repeat}</td><td>${e.ref_count||0}</td><td>${hist}</td>`;t.appendChild(tr);}}"
-    "function initDashboard(){refreshSys();refreshSlots();refreshPersisted();refreshStatus();"
-    "setInterval(refreshStatus,1000);setInterval(()=>{refreshSys();refreshPersisted();},5000);}"
+    "function initDashboard(){refreshSys();refreshSlots();refreshStatus();"
+    "setInterval(refreshStatus,1000);setInterval(refreshSys,5000);}"
     "tryAutoUnlock();"
     "</script></body></html>";
 
@@ -559,14 +554,6 @@ static esp_err_t learn_status_get_handler(httpd_req_t *req)
     return send_json(req, response);
 }
 
-static esp_err_t nvs_signals_get_handler(httpd_req_t *req)
-{
-    static char json[1024];
-    int len = ir_engine_read_all_nvs_signals(json, sizeof(json));
-    httpd_resp_set_type(req, "application/json");
-    return httpd_resp_send(req, json, len);
-}
-
 static esp_err_t learn_payload_get_handler(httpd_req_t *req)
 {
     uint8_t tick_len = 0;
@@ -695,17 +682,6 @@ esp_err_t app_web_server_start()
         .user_ctx = nullptr,
     };
     err = register_uri_handler_checked(s_server, &learn_payload_uri);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    const httpd_uri_t nvs_signals_uri = {
-        .uri = "/api/nvs/signals",
-        .method = HTTP_GET,
-        .handler = nvs_signals_get_handler,
-        .user_ctx = nullptr,
-    };
-    err = register_uri_handler_checked(s_server, &nvs_signals_uri);
     if (err != ESP_OK) {
         return err;
     }
