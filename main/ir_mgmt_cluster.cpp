@@ -70,6 +70,13 @@ static int serialize_learned_payload_json(char *buf, size_t cap)
 
 // ── Attribute push refresh ──────────────────────────────────────────────
 
+static void refresh_all_attributes();
+
+void ir_mgmt_refresh_attributes(void)
+{
+    refresh_all_attributes();
+}
+
 static void refresh_all_attributes()
 {
     if (s_ir_mgmt_endpoint_id == 0) return;

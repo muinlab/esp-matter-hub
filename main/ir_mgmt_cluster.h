@@ -45,3 +45,6 @@ esp_err_t ir_mgmt_cluster_init(esp_matter::node_t *node);
 
 /** Return the endpoint ID assigned to the IrManagement cluster (0 if not initialised). */
 uint16_t ir_mgmt_cluster_get_endpoint_id(void);
+
+/** Refresh all IrManagement attributes (call when learning state changes). */
+void ir_mgmt_refresh_attributes(void);

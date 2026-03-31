@@ -15,6 +15,7 @@
 
 #include "bridge_action.h"
 #include "ir_engine.h"
+#include "ir_mgmt_cluster.h"
 #include "status_led.h"
 
 static const char *TAG = "ir_engine";
@@ -259,6 +260,7 @@ static void update_learning_capture()
             s_learning.quality_score = s_pending_quality;
             status_led_set_learning(IR_LEARNING_READY);
             ESP_LOGI(TAG, "IR learning captured from RX%u len=%u", s_pending_rx_source, s_pending_payload_len);
+            ir_mgmt_refresh_attributes();
             return;
         }
     }
@@ -273,6 +275,7 @@ static void update_learning_capture()
         s_pending_rx_source = 0;
         status_led_set_learning(IR_LEARNING_FAILED);
         ESP_LOGW(TAG, "IR learning timeout after %" PRIu32 "ms", s_learning.elapsed_ms);
+        ir_mgmt_refresh_attributes();
     }
 }
 

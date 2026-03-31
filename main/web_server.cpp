@@ -94,6 +94,7 @@ static const char *kDashboardHtml =
     ".card{background:#fff;border-radius:12px;padding:16px;margin-bottom:16px;box-shadow:0 2px 10px rgba(0,0,0,.06)}"
     "button{padding:8px 12px;border:0;border-radius:8px;background:#0a84ff;color:#fff;cursor:pointer}"
     "button:disabled{background:#98a2b3;cursor:not-allowed}"
+    ".btn-replay{background:#a6e3a1;color:#1e1e2e}"
     "button.sm{padding:4px 8px;font-size:12px;background:#dc3545}"
     "input{padding:8px;border:1px solid #cfd6dd;border-radius:8px;margin-right:8px}"
     "table{width:100%;border-collapse:collapse}th,td{padding:8px;border-bottom:1px solid #e9edf0;text-align:left}"
@@ -133,7 +134,13 @@ static const char *kDashboardHtml =
     "<div class='card'><h3>IR Learn</h3><div class='row'>"
     "<input id='timeoutSec' type='number' value='15' min='1' step='1' style='width:60px'/>"
     "<button id='startLearnBtn' onclick='startLearn()'>Start</button>"
-    "</div><p id='status' class='muted'>-</p><p id='captureHint' class='pill wait'>Idle</p></div>"
+    "<input id='replayRepeat' type='number' value='3' min='1' max='10' style='width:50px;display:none'/>"
+    "<button id='replayBtn' class='btn-replay' onclick='replayLearn()' style='display:none'>Replay</button>"
+    "</div><p id='status' class='muted'>-</p><p id='captureHint' class='pill wait'>Idle</p>"
+    "<div id='learnResult' style='display:none;margin-top:8px'>"
+    "<p class='muted'>Carrier: <span id='lrCarrier'>-</span> Hz | Ticks: <span id='lrLen'>-</span></p>"
+    "<textarea id='lrTicks' readonly style='width:100%;height:48px;font-size:11px;font-family:monospace;background:#f9fafb;border:1px solid #cfd6dd;border-radius:6px;padding:6px;resize:none'></textarea>"
+    "</div></div>"
 
     "<div class='card'><h3>Persisted Signals</h3>"
     "<p class='muted'>Signals currently in the buffer (persisted to NVS when evicted).</p>"
@@ -144,9 +151,10 @@ static const char *kDashboardHtml =
     "function getKey(){return sessionStorage.getItem('apiKey')||'';}"
     "async function verifyKey(){const k=document.getElementById('apiKey').value;if(!k){document.getElementById('authStatus').textContent='Key required';return;}"
     "sessionStorage.setItem('apiKey',k);"
-    "const r=await fetch('/api/health');if(r.status===200){unlockUI();}else{document.getElementById('authStatus').textContent='Verifying...';unlockUI();}}"
+    "const ok=await testKey(k);if(ok){unlockUI();}else{sessionStorage.removeItem('apiKey');document.getElementById('authStatus').textContent='Invalid key';}}"
+    "async function testKey(k){try{const r=await fetch('/api/key/verify',{method:'POST',headers:{'X-Api-Key':k}});return r.status===200;}catch{return false;}}"
     "function unlockUI(){document.getElementById('mainContent').style.display='';document.getElementById('authCard').style.display='none';initDashboard();}"
-    "if(getKey()){document.getElementById('apiKey').value=getKey();unlockUI();}"
+    "async function tryAutoUnlock(){const k=getKey();if(!k)return;const ok=await testKey(k);if(ok){document.getElementById('apiKey').value=k;unlockUI();}else{sessionStorage.removeItem('apiKey');}}"
     "async function j(u,o){o=o||{};o.headers=o.headers||{};const k=getKey();if(k)o.headers['X-Api-Key']=k;const r=await fetch(u,o);return[r.status,await r.json().catch(()=>({}))];}"
 
     "async function refreshSys(){const [s,d]=await j('/api/health');if(s!==200)return;"
@@ -202,16 +210,35 @@ static const char *kDashboardHtml =
     "document.getElementById('status').textContent=`state=${d.state} elapsed=${d.elapsed_ms}ms captured_len=${d.captured_len||0} quality=${d.quality_score||0}`;"
     "const h=document.getElementById('captureHint');"
     "if(d.state==='in_progress'){h.className='pill wait';h.textContent='Listening...';}"
-    "else if(d.state==='ready'&&(d.captured_len||0)>0){const key=`${d.rx_source}-${d.captured_len}-${d.quality_score}`;h.className='pill ok';h.textContent=`Captured! len=${d.captured_len}`;if(lastCaptureKey!==key){h.classList.add('pulse');setTimeout(()=>h.classList.remove('pulse'),700);lastCaptureKey=key;}}"
-    "else if(d.state==='failed'){h.className='pill err';h.textContent='Timeout';}"
+    "else if(d.state==='ready'&&(d.captured_len||0)>0){const key=`${d.rx_source}-${d.captured_len}-${d.quality_score}`;h.className='pill ok';h.textContent=`Captured! len=${d.captured_len}`;if(lastCaptureKey!==key){h.classList.add('pulse');setTimeout(()=>h.classList.remove('pulse'),700);lastCaptureKey=key;fetchLearnedPayload();}}"
+    "else if(d.state==='failed'){h.className='pill err';h.textContent='Timeout';document.getElementById('learnResult').style.display='none';document.getElementById('replayBtn').style.display='none';}"
     "else{h.className='pill wait';h.textContent='Idle';}}"
 
+    "let learnedTicks='';"
+    "let learnedCarrier=38000;"
+    "async function fetchLearnedPayload(){const [s,d]=await j('/api/learn/payload');if(s!==200||!d.ticks)return;"
+    "learnedTicks=d.ticks;learnedCarrier=d.carrier||38000;"
+    "document.getElementById('lrCarrier').textContent=learnedCarrier;"
+    "document.getElementById('lrLen').textContent=d.len||0;"
+    "document.getElementById('lrTicks').value=learnedTicks;"
+    "document.getElementById('learnResult').style.display='';"
+    "document.getElementById('replayRepeat').style.display='';"
+    "document.getElementById('replayBtn').style.display='';}"
+
+    "async function replayLearn(){if(!learnedTicks)return;"
+    "const rep=Number(document.getElementById('replayRepeat').value)||3;"
+    "const [s,d]=await j('/api/learn/replay',{method:'POST',headers:{'Content-Type':'application/json'},"
+    "body:JSON.stringify({carrier_hz:learnedCarrier,repeat:rep,ticks:learnedTicks})});"
+    "document.getElementById('captureHint').textContent=s===200?'Replayed! (x'+rep+')':'Replay failed';}"
+
     "async function startLearn(){const t=Number(document.getElementById('timeoutSec').value)||15;"
+    "document.getElementById('learnResult').style.display='none';document.getElementById('replayRepeat').style.display='none';document.getElementById('replayBtn').style.display='none';"
     "const [s,d]=await j('/api/learn/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({timeout_s:t})});"
     "document.getElementById('captureHint').className='pill wait';document.getElementById('captureHint').textContent='Listening...';setTimeout(refreshStatus,300);}"
 
     "function initDashboard(){refreshSys();refreshBuffer();refreshSlots();refreshStatus();"
     "setInterval(refreshStatus,1000);setInterval(()=>{refreshSys();refreshBuffer();},5000);}"
+    "tryAutoUnlock();"
     "</script></body></html>";
 
 static esp_err_t send_json(httpd_req_t *req, const char *json)
@@ -384,6 +411,12 @@ static esp_err_t api_key_post_handler(httpd_req_t *req)
     save_api_key_to_nvs();
     ESP_LOGI(TAG, "API key updated and saved to NVS");
     return send_json(req, "{\"status\":\"ok\",\"message\":\"API key updated\"}");
+}
+
+static esp_err_t key_verify_post_handler(httpd_req_t *req)
+{
+    if (!check_api_key(req)) { return ESP_OK; }
+    return send_json(req, "{\"status\":\"ok\"}");
 }
 
 static esp_err_t slot_config_post_handler(httpd_req_t *req)
@@ -580,6 +613,62 @@ static esp_err_t learn_status_get_handler(httpd_req_t *req)
     return send_json(req, response);
 }
 
+static esp_err_t learn_payload_get_handler(httpd_req_t *req)
+{
+    uint8_t tick_len = 0;
+    uint32_t carrier = 0;
+    const uint16_t *ticks = ir_engine_get_learned_ticks(&tick_len, &carrier);
+
+    if (!ticks || tick_len == 0) {
+        return send_json(req, "{\"state\":\"not_ready\"}");
+    }
+
+    char response[1280];
+    int off = snprintf(response, sizeof(response),
+                       "{\"state\":\"ready\",\"carrier\":%lu,\"len\":%u,\"ticks\":\"",
+                       static_cast<unsigned long>(carrier), tick_len);
+    for (uint8_t i = 0; i < tick_len && off < (int)(sizeof(response) - 8); ++i) {
+        off += snprintf(response + off, sizeof(response) - off, "%02X%02X",
+                        ticks[i] & 0xFF, (ticks[i] >> 8) & 0xFF);
+    }
+    off += snprintf(response + off, sizeof(response) - off, "\"}");
+    return send_json(req, response);
+}
+
+static esp_err_t learn_replay_post_handler(httpd_req_t *req)
+{
+    if (!check_api_key(req)) { return ESP_OK; }
+
+    uint8_t tick_len = 0;
+    uint32_t carrier = 0;
+    const uint16_t *ticks = ir_engine_get_learned_ticks(&tick_len, &carrier);
+
+    if (!ticks || tick_len == 0) {
+        httpd_resp_set_status(req, "409 Conflict");
+        return send_json(req, "{\"error\":\"no learned signal\"}");
+    }
+
+    uint8_t repeat = 1;
+    if (req->content_len > 0 && req->content_len < 128) {
+        char body[128];
+        int read_len = httpd_req_recv(req, body, req->content_len);
+        if (read_len > 0) {
+            body[read_len] = '\0';
+            uint32_t parsed_repeat = 0;
+            if (parse_u32_field(body, "repeat", &parsed_repeat) && parsed_repeat > 0) {
+                repeat = static_cast<uint8_t>(parsed_repeat);
+            }
+        }
+    }
+
+    esp_err_t err = ir_engine_send_raw(0, carrier, repeat, ticks, tick_len);
+    if (err != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "replay failed");
+    }
+
+    return send_json(req, "{\"status\":\"ok\",\"replayed\":true}");
+}
+
 esp_err_t app_web_server_start()
 {
     if (s_server) {
@@ -644,6 +733,28 @@ esp_err_t app_web_server_start()
         return err;
     }
 
+    const httpd_uri_t learn_payload_uri = {
+        .uri = "/api/learn/payload",
+        .method = HTTP_GET,
+        .handler = learn_payload_get_handler,
+        .user_ctx = nullptr,
+    };
+    err = register_uri_handler_checked(s_server, &learn_payload_uri);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    const httpd_uri_t learn_replay_uri = {
+        .uri = "/api/learn/replay",
+        .method = HTTP_POST,
+        .handler = learn_replay_post_handler,
+        .user_ctx = nullptr,
+    };
+    err = register_uri_handler_checked(s_server, &learn_replay_uri);
+    if (err != ESP_OK) {
+        return err;
+    }
+
     const httpd_uri_t cache_uri = {
         .uri = "/api/buffer",
         .method = HTTP_GET,
@@ -662,6 +773,17 @@ esp_err_t app_web_server_start()
         .user_ctx = nullptr,
     };
     err = register_uri_handler_checked(s_server, &api_key_uri);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    const httpd_uri_t key_verify_uri = {
+        .uri = "/api/key/verify",
+        .method = HTTP_POST,
+        .handler = key_verify_post_handler,
+        .user_ctx = nullptr,
+    };
+    err = register_uri_handler_checked(s_server, &key_verify_uri);
     if (err != ESP_OK) {
         return err;
     }
