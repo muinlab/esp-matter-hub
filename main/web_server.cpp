@@ -221,8 +221,8 @@ static const char *kDashboardHtml =
 
     "async function refreshPersisted(){const r=await fetch('/api/nvs/signals');if(r.status!==200)return;const list=await r.json();"
     "const t=document.getElementById('persisted');t.innerHTML='';for(const e of list){const tr=document.createElement('tr');"
-    "const ls=e.last_seen_at>0?new Date(e.last_seen_at*1000).toLocaleString():'-';"
-    "tr.innerHTML=`<td>${e.signal_id}</td><td>${e.carrier_hz}</td><td>${e.repeat}</td><td>${e.ref_count||0}</td><td>${ls}</td>`;t.appendChild(tr);}}"
+    "const hist=(e.history||[]).map(ts=>ts>0?new Date(ts*1000).toLocaleString():'-').join(', ')||'-';"
+    "tr.innerHTML=`<td>${e.signal_id}</td><td>${e.carrier_hz}</td><td>${e.repeat}</td><td>${e.ref_count||0}</td><td>${hist}</td>`;t.appendChild(tr);}}"
     "function initDashboard(){refreshSys();refreshSlots();refreshPersisted();refreshStatus();"
     "setInterval(refreshStatus,1000);setInterval(()=>{refreshSys();refreshPersisted();},5000);}"
     "tryAutoUnlock();"

@@ -391,7 +391,10 @@ esp_err_t ir_engine_send_signal(uint32_t signal_id, uint8_t slot_id, uint32_t cl
         return ESP_ERR_NOT_FOUND;
     }
 
-    uint8_t blob[4 + 4 + 1 + 2 + 4 + 8 + 128 * 2];
+    // New format: header=56 bytes (4+4+1+2+4+1+40), old format: header=23 bytes (4+4+1+2+4+8)
+    static constexpr size_t kOldHeaderSize = 4 + 4 + 1 + 2 + 4 + 8;       // 23
+    static constexpr size_t kNewHeaderSize = 4 + 4 + 1 + 2 + 4 + 1 + 40;  // 56
+    uint8_t blob[kNewHeaderSize + 128 * 2];
     size_t blob_size = sizeof(blob);
     nvs_err = nvs_get_blob(nvs_handle, ckey, blob, &blob_size);
     nvs_close(nvs_handle);
@@ -401,7 +404,6 @@ esp_err_t ir_engine_send_signal(uint32_t signal_id, uint8_t slot_id, uint32_t cl
         return ESP_ERR_NOT_FOUND;
     }
 
-    static constexpr size_t kNewHeaderSize = 4 + 4 + 1 + 2 + 4 + 8;
     size_t off = 0;
     uint32_t sig_id_stored, carrier_hz;
     uint8_t repeat;
@@ -410,8 +412,11 @@ esp_err_t ir_engine_send_signal(uint32_t signal_id, uint8_t slot_id, uint32_t cl
     memcpy(&carrier_hz,    blob + off, 4); off += 4;
     memcpy(&repeat,        blob + off, 1); off += 1;
     memcpy(&tc16,          blob + off, 2); off += 2;
+    // Detect format by blob size and skip header fields accordingly
     if (blob_size >= kNewHeaderSize + tc16 * sizeof(uint16_t)) {
-        off += 4 + 8; // skip ref_count + last_seen_at
+        off += 4 + 1 + 40; // skip ref_count + history_count + history[5]
+    } else if (blob_size >= kOldHeaderSize + tc16 * sizeof(uint16_t)) {
+        off += 4 + 8; // skip ref_count + last_seen_at (old format)
     }
     if (tc16 == 0 || tc16 > 128 || blob_size < off + tc16 * sizeof(uint16_t)) {
         ESP_LOGW(TAG, "Signal %" PRIu32 " blob corrupt", signal_id);
@@ -543,34 +548,59 @@ int ir_engine_read_all_nvs_signals(char *out_json, size_t out_size)
         // Only process signal keys (c{id})
         if (info.key[0] == 'c' && info.key[1] >= '0' && info.key[1] <= '9') {
             size_t blob_size = 0;
+            // New header=56, old header=23; max ticks = 128*2 = 256
+            static constexpr size_t kOldHdr = 4 + 4 + 1 + 2 + 4 + 8;      // 23
+            static constexpr size_t kNewHdr = 4 + 4 + 1 + 2 + 4 + 1 + 40; // 56
             if (nvs_get_blob(handle, info.key, nullptr, &blob_size) == ESP_OK && blob_size >= 11) {
-                uint8_t blob[4 + 4 + 1 + 2 + 4 + 8 + 128 * 2];
+                uint8_t blob[kNewHdr + 128 * 2];
                 if (blob_size <= sizeof(blob) && nvs_get_blob(handle, info.key, blob, &blob_size) == ESP_OK) {
                     uint32_t sig_id, carr;
                     uint8_t rep;
                     uint16_t tc;
                     uint32_t ref_count = 0;
-                    int64_t last_seen = 0;
+                    uint8_t  hist_count = 0;
+                    int64_t  history[5] = {};
                     size_t p = 0;
                     memcpy(&sig_id, blob + p, 4); p += 4;
                     memcpy(&carr,   blob + p, 4); p += 4;
                     memcpy(&rep,    blob + p, 1); p += 1;
                     memcpy(&tc,     blob + p, 2); p += 2;
-                    // New format has ref_count + last_seen_at
-                    if (blob_size >= p + 4 + 8) {
+                    if (blob_size >= kNewHdr) {
+                        // New format: ref_count(4) + history_count(1) + history[5*8]
+                        memcpy(&ref_count,  blob + p, 4); p += 4;
+                        memcpy(&hist_count, blob + p, 1); p += 1;
+                        if (hist_count > 5) hist_count = 5;
+                        for (uint8_t hi = 0; hi < hist_count; ++hi) {
+                            memcpy(&history[hi], blob + p, 8); p += 8;
+                        }
+                    } else if (blob_size >= kOldHdr) {
+                        // Old format: ref_count(4) + last_seen_at(8)
+                        int64_t last_seen = 0;
                         memcpy(&ref_count, blob + p, 4); p += 4;
                         memcpy(&last_seen, blob + p, 8); p += 8;
+                        if (last_seen != 0) {
+                            hist_count = 1;
+                            history[0] = last_seen;
+                        }
                     }
 
-                    if (off < (int)(out_size - 120)) {
+                    // Build history JSON array — budget: 5 * (20 digits + separator) ~ 110 chars
+                    // plus outer fields ~ 120 chars; reserve 250 total
+                    if (off < (int)(out_size - 250)) {
                         off += snprintf(out_json + off, out_size - off,
-                                        "%s{\"signal_id\":%lu,\"carrier_hz\":%lu,\"repeat\":%u,\"tick_count\":%u,\"ref_count\":%lu,\"last_seen_at\":%lld}",
+                                        "%s{\"signal_id\":%lu,\"carrier_hz\":%lu,\"repeat\":%u,\"tick_count\":%u,\"ref_count\":%lu,\"history\":[",
                                         first ? "" : ",",
                                         static_cast<unsigned long>(sig_id),
                                         static_cast<unsigned long>(carr),
                                         rep, tc,
-                                        static_cast<unsigned long>(ref_count),
-                                        static_cast<long long>(last_seen));
+                                        static_cast<unsigned long>(ref_count));
+                        for (uint8_t hi = 0; hi < hist_count; ++hi) {
+                            off += snprintf(out_json + off, out_size - off,
+                                            "%s%lld",
+                                            hi == 0 ? "" : ",",
+                                            static_cast<long long>(history[hi]));
+                        }
+                        off += snprintf(out_json + off, out_size - off, "]}");
                         first = false;
                     }
                 }
@@ -641,25 +671,54 @@ esp_err_t ir_engine_send_raw(uint32_t signal_id, uint32_t carrier_hz, uint8_t re
         nvs_handle_t nvs_h;
         esp_err_t nvs_err = nvs_open(kNvsCacheNamespace, NVS_READWRITE, &nvs_h);
         if (nvs_err == ESP_OK) {
-            // Read existing ref_count to increment it
+            // Read existing blob to get ref_count and history
             uint32_t existing_ref_count = 0;
+            uint8_t  existing_hist_count = 0;
+            int64_t  existing_history[5] = {};
+            static constexpr size_t kOldHdrSave = 4 + 4 + 1 + 2 + 4 + 8;      // 23
+            static constexpr size_t kNewHdrSave = 4 + 4 + 1 + 2 + 4 + 1 + 40; // 56
             {
                 size_t existing_size = 0;
                 if (nvs_get_blob(nvs_h, ckey, nullptr, &existing_size) == ESP_OK &&
-                    existing_size >= (4 + 4 + 1 + 2 + 4 + 8)) {
-                    uint8_t existing_blob[4 + 4 + 1 + 2 + 4 + 8 + 128 * 2];
+                    existing_size >= kOldHdrSave) {
+                    uint8_t existing_blob[kNewHdrSave + 128 * 2];
                     if (existing_size <= sizeof(existing_blob) &&
                         nvs_get_blob(nvs_h, ckey, existing_blob, &existing_size) == ESP_OK) {
                         memcpy(&existing_ref_count, existing_blob + 11, 4);
+                        if (existing_size >= kNewHdrSave) {
+                            // New format: history_count at offset 15
+                            memcpy(&existing_hist_count, existing_blob + 15, 1);
+                            if (existing_hist_count > 5) existing_hist_count = 5;
+                            for (uint8_t hi = 0; hi < existing_hist_count; ++hi) {
+                                memcpy(&existing_history[hi], existing_blob + 16 + hi * 8, 8);
+                            }
+                        } else {
+                            // Old format: last_seen_at at offset 15
+                            int64_t last_seen = 0;
+                            memcpy(&last_seen, existing_blob + 15, 8);
+                            if (last_seen != 0) {
+                                existing_hist_count = 1;
+                                existing_history[0] = last_seen;
+                            }
+                        }
                     }
                 }
             }
+
             uint32_t new_ref_count = existing_ref_count + 1;
             int64_t now = static_cast<int64_t>(time(nullptr));
 
-            // Blob: signal_id(4)+carrier_hz(4)+repeat(1)+tick_count(2)+ref_count(4)+last_seen_at(8)+ticks(N*2)
-            const size_t blob_size = 4 + 4 + 1 + 2 + 4 + 8 + copy_count * sizeof(uint16_t);
-            uint8_t blob[4 + 4 + 1 + 2 + 4 + 8 + 128 * 2];
+            // Shift history right and prepend current timestamp (newest-first ring buffer)
+            uint8_t new_hist_count = existing_hist_count < 5 ? existing_hist_count + 1 : 5;
+            int64_t new_history[5] = {};
+            new_history[0] = now;
+            for (uint8_t hi = 1; hi < new_hist_count; ++hi) {
+                new_history[hi] = existing_history[hi - 1];
+            }
+
+            // Blob: sig_id(4)+carrier(4)+repeat(1)+tc16(2)+ref_count(4)+hist_count(1)+hist[5*8]+ticks
+            const size_t blob_size = kNewHdrSave + copy_count * sizeof(uint16_t);
+            uint8_t blob[kNewHdrSave + 128 * 2];
             size_t boff = 0;
             uint16_t tc16 = static_cast<uint16_t>(copy_count);
             memcpy(blob + boff, &signal_id,       4); boff += 4;
@@ -667,13 +726,15 @@ esp_err_t ir_engine_send_raw(uint32_t signal_id, uint32_t carrier_hz, uint8_t re
             memcpy(blob + boff, &repeat,          1); boff += 1;
             memcpy(blob + boff, &tc16,            2); boff += 2;
             memcpy(blob + boff, &new_ref_count,   4); boff += 4;
-            memcpy(blob + boff, &now,             8); boff += 8;
+            memcpy(blob + boff, &new_hist_count,  1); boff += 1;
+            memcpy(blob + boff, new_history,     40); boff += 40; // always write all 5 slots
             memcpy(blob + boff, local_ticks, copy_count * sizeof(uint16_t));
 
             nvs_set_blob(nvs_h, ckey, blob, blob_size);
             nvs_commit(nvs_h);
             nvs_close(nvs_h);
-            ESP_LOGI(TAG, "Saved signal_id=%" PRIu32 " to NVS (ref_count=%" PRIu32 ")", signal_id, new_ref_count);
+            ESP_LOGI(TAG, "Saved signal_id=%" PRIu32 " to NVS (ref_count=%" PRIu32 " hist=%u)",
+                     signal_id, new_ref_count, new_hist_count);
         } else {
             ESP_LOGW(TAG, "Failed to open NVS for signal save: %s", esp_err_to_name(nvs_err));
         }
