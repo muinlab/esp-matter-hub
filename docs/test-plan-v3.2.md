@@ -1,7 +1,7 @@
-# ESP Matter IR Hub v3.3 — 테스트 계획
+# ESP Matter IR Hub v3.5 — 테스트 계획
 
 > **작성일**: 2026-03-31
-> **대상**: v3.3 신규/변경 기능
+> **대상**: v3.5 신규/변경 기능 (v3.3 기존 + 웹 UI 전면 개편)
 
 ---
 
@@ -27,13 +27,27 @@
 3. **기대**: OK, IR LED 송신, 시리얼에 `ticks=67 (raw_bytes=268 decoded=134)`
 4. **확인**: hex 자동 디코딩 동작. IR 기기 반응.
 
-## TC-04: 웹 IR Replay
+## TC-04: 웹 IR Replay (기본 모드)
 
 1. 웹 UI에서 IR Learn → Start → 리모컨 누름
 2. Captured! 후 Replay 버튼 + repeat 입력 표시
-3. repeat=3으로 Replay 클릭
+3. repeat=3으로 Replay 클릭 (Interval 체크 해제)
 4. **기대**: "Replayed! (x3)", IR 기기 반응
 5. **확인**: 시리얼에 `TX raw signal_id=0 items=34 repeat=3`
+
+## TC-04a: 웹 IR Replay (Interval 모드)
+
+1. TC-02 학습 완료 상태에서
+2. Replay 버튼 + Repeat 입력이 표시되는지 확인
+3. Interval 체크박스가 기본 해제(disabled) 상태인지 확인
+4. Interval 체크 → duration 입력 활성화 확인
+5. repeat=5, duration=1000ms 설정 → Replay 클릭
+6. **기대**: "Replayed! (x5, 1000ms interval)", 약 4초간 1초 간격으로 5번 IR 송신
+7. **확인**: 시리얼에 `TX raw signal_id=0` 로그가 5번 (약 1초 간격)
+8. Interval 체크 해제 → duration 입력 비활성화 확인
+9. 체크 해제 상태에서 Replay → 기존 burst 모드로 동작
+10. **상한 테스트**: repeat=20, duration=10000ms 설정 → Replay
+11. **기대**: repeat=10, duration=5000ms로 클램핑됨 (최대 ~50초)
 
 ## TC-05: NVS 즉시 저장
 
@@ -95,6 +109,83 @@
 3. Apple Home에서 슬롯 0 On/Off 토글
 4. **기대**: On → signal_id=100 IR 송신, Off → signal_id=101 IR 송신
 5. **확인**: 시리얼에서 `TX signal_id=100/101` 로그
+
+## TC-13: 활동 로그 (Activity Log)
+
+1. 웹 UI에서 Activity Log 카드 확인
+2. IR Learn 시작 → 로그에 `IR Learn` 항목 (시작) 확인
+3. IR Learn 성공 → 로그에 `IR Learn` 항목 (`result:ready`, `len:N`) 확인
+4. IR Learn 타임아웃 → 로그에 `IR Learn` 항목 (`result:failed`) 확인
+5. send_raw 실행 → `Send Raw` 로그 확인
+6. Replay 실행 → `Replay` 로그 확인 (carrier, repeat, dur 포함)
+7. 슬롯 설정 변경 → `Slot Config` 로그 확인
+8. API Key 변경 → `API Key` 로그 확인
+9. **기대**: 모든 작업이 newest-first로 표시, 자동 갱신 (10초)
+10. 50개 초과 시 오래된 항목 삭제 (FIFO)
+11. **확인**: 재부팅 후 로그 유지 (NVS)
+
+## TC-14: Signal Buffer (RAM)
+
+1. send_raw로 signal_id 100, 200, 300 전송
+2. 웹 UI Signal Buffer 카드 확인
+3. **기대**: 3개 항목 표시 (Signal ID, Carrier, Repeat, Ticks 미리보기)
+4. 같은 signal_id 100 재전송
+5. **기대**: signal_id=100이 최상단으로 이동 (LRU), 중복 없음
+6. 16개 초과 전송 시 가장 오래된 항목 제거
+7. **확인**: 재부팅 후 Signal Buffer 비어있음 (RAM only)
+
+## TC-15: Saved Test Signals (NVS)
+
+1. Signal Buffer에서 "Use as Test" 버튼 클릭
+2. 이름 입력 다이얼로그에서 "TV Power" 입력
+3. **기대**: Saved Test Signals 테이블에 항목 추가
+4. 같은 이름으로 재저장 시도
+5. **기대**: "Duplicate name" 에러
+6. Delete 버튼 클릭
+7. **기대**: 항목 삭제, 테이블 갱신
+8. **확인**: 재부팅 후 저장된 테스트 신호 유지 (NVS)
+
+## TC-16: Endpoint Slots 드롭다운
+
+1. TC-15에서 Saved Test Signals에 항목 2개 이상 등록
+2. Endpoint Slots에서 signal_id_a 옆 ▼ 버튼 클릭
+3. **기대**: Saved Test Signals 목록 드롭다운 표시 (이름 + signal_id)
+4. 항목 선택
+5. **기대**: signal_id 자동 입력
+6. signal_id_b에서도 동일 동작 확인
+
+## TC-17: 웹 UI IR Learn 상세 보기
+
+1. 웹에서 IR Learn → Start → 리모컨 누름
+2. READY 상태 확인
+3. **기대**: 구조화된 레이아웃 표시
+   - Carrier Hz (값)
+   - Ticks 수 (값)
+   - Quality Score (값)
+   - Ticks hex (접을 수 있는 textarea, 기본 접힘)
+   - Repeat 입력 + Replay 버튼
+   - Interval 체크박스 + Duration 입력 (기본 비활성)
+
+## TC-18: REST API 엔드포인트
+
+1. `curl -H "X-Api-Key: <key>" http://<ip>/api/logs` → 활동 로그 JSON 배열
+2. `curl -H "X-Api-Key: <key>" http://<ip>/api/signal-buffer` → Signal Buffer JSON 배열
+3. `curl -H "X-Api-Key: <key>" http://<ip>/api/test-signals` → Saved Test Signals JSON 배열
+4. POST /api/test-signals + 유효한 body → 201 OK
+5. POST /api/test-signals + 중복 이름 → 409 Conflict
+6. DELETE /api/test-signals/0 → 200 OK
+7. DELETE /api/test-signals/99 → 404 Not Found
+8. **확인**: API Key 없이 접근 시 401 응답
+
+## TC-19: REPL dump_log 명령
+
+1. REPL에서 `set_key <api_key>` 실행 (시리얼 로그에서 API 키 확인)
+2. `set_ip <device_ip>` 실행 (기본 192.168.75.202)
+3. `dump_log` 실행
+4. **기대**: 활동 로그 JSON 배열 출력 (newest-first)
+5. IR Learn, send_raw 등 실행 후 다시 `dump_log`
+6. **기대**: 새 로그 항목이 추가되어 표시
+7. API 키 미설정 시 `dump_log` → "API 키가 설정되지 않음" 에러
 
 ---
 

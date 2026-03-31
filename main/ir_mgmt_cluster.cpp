@@ -10,6 +10,8 @@
 #include "ir_engine.h"
 #include "bridge_action.h"
 #include "app_priv.h"
+#include "activity_log.h"
+#include "test_signals.h"
 
 static const char *TAG = "ir_mgmt";
 
@@ -264,6 +266,12 @@ static esp_err_t cmd_send_signal_with_raw(const ConcreteCommandPath &path, TLVRe
         return err;
     }
 
+    signal_buffer_insert(signal_id, carrier_hz, repeat, ticks, tick_count);
+    char act_detail[48];
+    snprintf(act_detail, sizeof(act_detail), "{\"sig\":%lu,\"ticks\":%u}",
+             static_cast<unsigned long>(signal_id), (unsigned)tick_count);
+    (void)activity_log_append(ACT_SEND_SIGNAL_RAW, act_detail);
+
     refresh_all_attributes();
     return ESP_OK;
 }
@@ -280,6 +288,7 @@ static esp_err_t cmd_sync_buffer(const ConcreteCommandPath &path, TLVReader &tlv
 static esp_err_t cmd_factory_reset(const ConcreteCommandPath &path, TLVReader &tlv, void *opaque)
 {
     ESP_LOGW(TAG, "FactoryReset: initiating factory reset via Matter command");
+    (void)activity_log_append(ACT_FACTORY_RESET, "{}");
     chip::DeviceLayer::ConfigurationMgr().InitiateFactoryReset();
     return ESP_OK;
 }
@@ -296,6 +305,7 @@ static esp_err_t cmd_dump_nvs(const ConcreteCommandPath &path, TLVReader &tlv, v
     esp_matter::attribute::set_val(s_ir_mgmt_endpoint_id, IR_MGMT_CLUSTER_ID, IR_MGMT_ATTR_BUFFER_SNAPSHOT, &val);
 
     ESP_LOGI(TAG, "DumpNVS: wrote %d bytes to BufferSnapshot", len);
+    (void)activity_log_append(ACT_DUMP_NVS, "{}");
     refresh_all_attributes();
     return ESP_OK;
 }

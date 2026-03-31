@@ -1,7 +1,7 @@
-# ESP Matter IR Hub — API 명세서 v3.2
+# ESP Matter IR Hub — API 명세서 v3.5
 
 > **대상**: 앱 개발자
-> **버전**: 3.2.3 (2026-03-31)
+> **버전**: 3.5.0 (2026-03-31)
 
 ---
 
@@ -106,15 +106,13 @@
 
 **Response:** Matter Status Code (SUCCESS / FAILURE)
 
-### 2.5 SyncBuffer (0x0C) — 버퍼 → NVS 동기화
+### 2.5 SyncBuffer (0x0C) — DumpNVS 별칭
 
 **Request:** 파라미터 없음
 
 **Response:** Matter Status Code (SUCCESS)
 
-**동작 후 속성 변화:**
-- BufferSnapshot(0x0007)에 버퍼 내용 기록 (JSON 배열)
-- 버퍼 비움 (clear)
+> v3.3부터 RAM 버퍼가 제거되어 DumpNVS(0x0E)와 동일하게 동작합니다.
 
 ### 2.6 DumpNVS (0x0E) — NVS 전체 신호 조회
 
@@ -123,8 +121,7 @@
 **Response:** Matter Status Code (SUCCESS)
 
 **동작 후 속성 변화:**
-- SyncBuffer 실행 (버퍼 → NVS + 비움)
-- NVS의 모든 IR 신호를 BufferSnapshot(0x0007)에 기록
+- NVS의 모든 IR 신호를 BufferSnapshot(0x0007)에 JSON 배열로 기록
 
 ### 2.7 FactoryReset (0x0D) — 팩토리 리셋
 
@@ -244,17 +241,28 @@
 
 ---
 
-## 4. Signal Buffer
+## 4. Signal Buffer (RAM)
 
-- 16개 엔트리, LRU 교체
-- `SendSignalWithRaw`로 전송된 신호가 자동 저장
-- 버퍼가 가득 차면 NVS에 일괄 저장 (ref_count 증가, timestamp 기록)
-- `SyncBuffer(0x0C)`로 수동 flush + 비우기
-- 재부팅 시 슬롯에 설정된 signal_id를 NVS에서 복원
+- 16개 엔트리, LRU 교체 (재부팅 시 소멸)
+- `SendSignalWithRaw`로 전송된 신호가 자동 저장 (RAM + NVS 즉시 저장)
+- 동일 signal_id 재수신 시 최상단으로 이동 (중복 없음)
+- NVS에는 매 송신마다 즉시 저장 (ref_count 증가, timestamp history 기록)
 
 ---
 
-## 5. 앱 개발 흐름
+## 5. NVS 네임스페이스 (v3.5)
+
+| 네임스페이스 | 용도 | 키 형식 |
+|-------------|------|---------|
+| `web_config` | API 키 | `api_key` (string) |
+| `bridge_map` | 슬롯 설정 | `s{N}_type`, `s{N}_a`, `s{N}_b` |
+| `ir_cache` | IR 신호 데이터 | `c{signal_id}` (blob, 56B header + ticks) |
+| `act_log` | 활동 로그 | `head`, `count` (u16), `e{N}` (blob, N=0..49) |
+| `test_sig` | 테스트 신호 | `count` (u8), `t{N}` (blob, N=0..15) |
+
+---
+
+## 6. 앱 개발 흐름
 
 ```
 1. 커미셔닝
@@ -279,10 +287,11 @@
 
 ---
 
-## 6. 변경 이력
+## 7. 변경 이력
 
 | 버전 | 날짜 | 변경 내용 |
 |------|------|-----------|
+| 3.5.0 | 2026-03-31 | NVS 네임스페이스 정리 (act_log, test_sig 추가), Activity Log NVS FIFO 50개, IR Learn 완료 시 로그 기록, Signal Buffer RAM LRU 16개, Saved Test Signals NVS 16개, SyncBuffer/DumpNVS 별칭 유지 |
 | 3.2.3 | 2026-03-31 | IR TX 안정화 (rmt_set_tx_carrier 제거), chip-tool BYTES hex 자동 디코딩, ticks 인코딩 주의사항 추가 |
 | 3.2.2 | 2026-03-31 | Request/Response 인터페이스 명시, SaveSignal(0x02) 제거 |
 | 3.2.1 | 2026-03-31 | DumpNVS(0x0E) 추가, LearnedPayload에 ticks 포함, SyncBuffer 버퍼 비움, 미사용 커맨드/속성 제거 |

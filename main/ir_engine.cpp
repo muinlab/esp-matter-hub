@@ -13,6 +13,7 @@
 #include <freertos/task.h>
 #include <nvs.h>
 
+#include "activity_log.h"
 #include "bridge_action.h"
 #include "ir_engine.h"
 #include "ir_mgmt_cluster.h"
@@ -229,6 +230,11 @@ static void update_learning_capture()
             s_learning.quality_score = s_pending_quality;
             status_led_set_learning(IR_LEARNING_READY);
             ESP_LOGI(TAG, "IR learning captured from RX%u len=%u", s_pending_rx_source, s_pending_payload_len);
+            {
+                char detail[48];
+                snprintf(detail, sizeof(detail), "{\"result\":\"ready\",\"len\":%u}", s_pending_payload_len);
+                (void)activity_log_append(ACT_IR_LEARN, detail);
+            }
             ir_mgmt_refresh_attributes();
             return;
         }
@@ -244,6 +250,7 @@ static void update_learning_capture()
         s_pending_rx_source = 0;
         status_led_set_learning(IR_LEARNING_FAILED);
         ESP_LOGW(TAG, "IR learning timeout after %" PRIu32 "ms", s_learning.elapsed_ms);
+        (void)activity_log_append(ACT_IR_LEARN, "{\"result\":\"failed\"}");
         ir_mgmt_refresh_attributes();
     }
 }

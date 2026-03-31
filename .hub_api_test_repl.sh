@@ -40,6 +40,9 @@ run_cmd() {
     /buffer_snapshot)  buffer_snapshot ;;
     /sync_buffer)      sync_buffer ;;
     /dump_nvs)         dump_nvs ;;
+    /dump_log)         dump_log ;;
+    /set_key\ *)       set_key "${input#/set_key }" ;;
+    /set_ip\ *)        set_ip "${input#/set_ip }" ;;
     /factory_reset)    factory_reset ;;
     /smoke)            smoke ;;
     /pair)             pair ;;

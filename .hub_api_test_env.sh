@@ -6,6 +6,8 @@ CLUSTER_ID="0x1337FC01"
 COMMISSIONER_NAME="${COMMISSIONER_NAME:-beta}"
 NODE_ID="${1:-1}"
 ENDPOINT_ID="${2:-10}"
+DEVICE_IP="${DEVICE_IP:-192.168.75.202}"
+WEB_API_KEY="${WEB_API_KEY:-}"
 
 # ── Output Filters ──────────────────────────────────────────
 
@@ -157,6 +159,34 @@ factory_reset()  { send_cmd 0x0D; }
 dump_nvs()       { send_cmd 0x0E; echo "Reading snapshot..."; buffer_snapshot; }
 buffer_snapshot() { read_attr 0x0007; }
 
+dump_log() {
+  if [[ -z "$WEB_API_KEY" ]]; then
+    printf '\033[33mAPI 키가 설정되지 않음. set_key <key> 로 설정하세요.\033[0m\n'
+    return 1
+  fi
+  printf 'Fetching activity log from %s ...\n' "$DEVICE_IP"
+  curl -s -H "X-Api-Key: $WEB_API_KEY" "http://${DEVICE_IP}/api/logs" | python3 -m json.tool 2>/dev/null || \
+    curl -s -H "X-Api-Key: $WEB_API_KEY" "http://${DEVICE_IP}/api/logs"
+}
+
+set_key() {
+  if [[ -z "${1:-}" ]]; then
+    echo "usage: set_key <api_key>"
+    return 1
+  fi
+  WEB_API_KEY="$1"
+  printf 'API key set: %s\n' "$WEB_API_KEY"
+}
+
+set_ip() {
+  if [[ -z "${1:-}" ]]; then
+    echo "usage: set_ip <device_ip>"
+    return 1
+  fi
+  DEVICE_IP="$1"
+  printf 'Device IP set: %s\n' "$DEVICE_IP"
+}
+
 commission() {
   local timeout="${1:-300}"
   send_cmd 0x08 "{\"0:U16\":${timeout}}"
@@ -255,8 +285,11 @@ api_help() {
 ── NVS/시스템 ─────────────────────────────────────────────
   sync_buffer                 dump_nvs 별칭 (RAM 버퍼 없음)
   dump_nvs                    NVS 전체 신호 조회 → 스냅샷
+  dump_log                    활동 로그 조회 (웹 API)
   buffer_snapshot             BufferSnapshot 속성 읽기
   factory_reset               Matter 팩토리 리셋 (전체 초기화)
+  set_key <key>               웹 API 키 설정
+  set_ip <ip>                 디바이스 IP 설정 (기본: 192.168.75.202)
 
 ── 커미셔닝 ───────────────────────────────────────────────
   pair [setup_pin]            온네트워크 커미셔닝 (WiFi 연결 후)
