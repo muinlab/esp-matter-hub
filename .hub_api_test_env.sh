@@ -97,7 +97,8 @@ _filter_pair() {
     return 1
   fi
 
-  printf 'Unknown result\n'
+  printf '\033[33mUnknown result. chip-tool output:\033[0m\n'
+  printf '%s\n' "$output" | tail -20
   return 1
 }
 
