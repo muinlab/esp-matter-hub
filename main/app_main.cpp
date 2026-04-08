@@ -73,7 +73,7 @@ static bool s_mdns_retry_running = false;
 static portMUX_TYPE s_mdns_retry_lock = portMUX_INITIALIZER_UNLOCKED;
 
 /* OTA -------------------------------------------------------------------- */
-#define FIRMWARE_VERSION      "v0.1.7"
+#define FIRMWARE_VERSION      "v0.1.8"
 #define GITHUB_REPO           "muinlab/esp-matter-hub"
 #define GITHUB_API_LATEST_URL "https://api.github.com/repos/" GITHUB_REPO "/releases/latest"
 #define OTA_DEFAULT_URL       "https://github.com/" GITHUB_REPO "/releases/latest/download/esp-matter-hub.bin"
@@ -218,7 +218,7 @@ static void auto_ota_task(void *arg)
     while (!s_network_ready) {
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
-    vTaskDelay(pdMS_TO_TICKS(30000)); // IP 취득 후 힙 안정화 대기
+    vTaskDelay(pdMS_TO_TICKS(15000)); // IP 취득 후 힙 안정화 대기
 
     while (true) {
 
