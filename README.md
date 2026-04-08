@@ -47,6 +47,19 @@ The hub exposes up to **8 bridge slots**, each mappable to a registered IR devic
 </details>
 
 <details>
+<summary><b>HTTPS OTA Auto-Update</b></summary>
+
+- Checks [GitHub Releases](https://github.com/muinlab/esp-matter-hub/releases) every hour for a newer version
+- Semantic version comparison (`vX.Y.Z`) — downgrade protection built in
+- HTTP endpoint: `POST /api/ota/trigger` for manual OTA trigger (with optional `{"url":"..."}` body)
+- HTTP endpoint: `GET /api/ota/status` to query OTA state
+- Purple slow-blink LED indicator during download
+- `release.sh` — one-command local build + GitHub release automation
+- `flash_remote.sh` — flash from release binaries without ESP-IDF
+
+</details>
+
+<details>
 <summary><b>IR Engine (RMT-based)</b></summary>
 
 - Captures IR signals via 2 RX channels (RMT CH4, CH5) with quality scoring
@@ -61,10 +74,11 @@ The hub exposes up to **8 bridge slots**, each mappable to a registered IR devic
 <details>
 <summary><b>IrManagement Custom Cluster (0x1337FC01)</b></summary>
 
-- Fully replaces the HTTP REST API surface over the Matter data model
-- Commands: `StartLearning`, `CancelLearning`, `SaveSignal`, `DeleteSignal`, `SendSignal`, `AssignSignalToDev`, `RegisterDevice`, `RenameDevice`, `AssignDeviceToSlot`, `OpenCommissioning`, `GetSignalPayload`
-- Attributes: `LearnState`, `LearnedPayload`, `SavedSignalsList`, `SlotAssignments`, `RegisteredDevices`, `SignalPayloadData`
-- Event: `LearningCompleted` emitted when capture finishes
+- Exposes IR learning / signal management / slot wiring over the Matter data model
+- **Attributes:** `LearnState` (0x0000), `LearnedPayload` (0x0001), `BufferSnapshot` (0x0007), `Health` (0x0008)
+- **Commands:** `StartLearning` (0x00), `CancelLearning` (0x01), `OpenCommissioning` (0x08), `SendSignalWithRaw` (0x0B), `SyncBuffer` (0x0C), `FactoryReset` (0x0D), `DumpNVS` (0x0E), `GetHealth` (0x0F)
+- **Event:** `LearningCompleted` (0x00) — emitted when IR capture finishes
+- `Health` attribute returns firmware version, heap, uptime, slots, mDNS state, LED state, OTA status as JSON
 - Controllable via `chip-tool` using `hub_api.sh` wrapper
 
 </details>
@@ -268,6 +282,70 @@ Once commissioned and connected to Wi-Fi, the hub registers on mDNS and the web 
 
 ```
 http://esp-matter-hub.local
+```
+
+**REST API endpoints** (all require `X-Api-Key` header):
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/health` | System status (heap, mDNS, LED, slots) |
+| GET | `/api/slots` | Bridge slot configuration |
+| POST | `/api/slots/{id}/config` | Configure a slot |
+| POST | `/api/learn/start` | Start IR learning |
+| GET | `/api/learn/status` | Learning state |
+| GET | `/api/learn/payload` | Captured signal payload |
+| POST | `/api/learn/replay` | Replay learned signal |
+| POST | `/api/ota/trigger` | Trigger OTA update (optional `{"url":"..."}`) |
+| GET | `/api/ota/status` | OTA progress (`{"running": true/false}`) |
+| POST | `/api/commissioning/open` | Open commissioning window |
+| GET | `/api/logs` | Activity log |
+
+---
+
+## OTA & Deployment
+
+### Automatic OTA
+
+The hub checks [GitHub Releases](https://github.com/muinlab/esp-matter-hub/releases) every hour:
+
+```
+I app_main: 최신 버전: v0.1.5 / 현재: v0.1.4
+I app_main: 업그레이드 버전 발견, OTA 시작
+```
+
+During download the onboard LED blinks **purple**. The device reboots automatically on success.
+
+### Manual OTA
+
+```bash
+curl -X POST http://esp-matter-hub.local/api/ota/trigger \
+  -H 'X-Api-Key: <key>'
+
+# Custom firmware URL
+curl -X POST http://esp-matter-hub.local/api/ota/trigger \
+  -H 'X-Api-Key: <key>' \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com/firmware.bin"}'
+```
+
+### Create a Release
+
+Requires [GitHub CLI](https://cli.github.com/) (`gh auth login`):
+
+```bash
+# Bump FIRMWARE_VERSION in main/app_main.cpp, then:
+./release.sh v1.2.3
+```
+
+This builds the firmware, creates a git tag, and uploads binaries to GitHub Releases.
+
+### Flash from Release (no ESP-IDF required)
+
+```bash
+pip install esptool
+gh release download --repo muinlab/esp-matter-hub --dir .
+./flash_remote.sh                     # auto-detect port
+./flash_remote.sh /dev/cu.usbserial-0001
 ```
 
 ---
