@@ -73,7 +73,7 @@ static bool s_mdns_retry_running = false;
 static portMUX_TYPE s_mdns_retry_lock = portMUX_INITIALIZER_UNLOCKED;
 
 /* OTA -------------------------------------------------------------------- */
-#define FIRMWARE_VERSION      "v0.1.1"
+#define FIRMWARE_VERSION      "v0.1.2"
 #define GITHUB_REPO           "muinlab/esp-matter-hub"
 #define GITHUB_API_LATEST_URL "https://api.github.com/repos/" GITHUB_REPO "/releases/latest"
 #define OTA_DEFAULT_URL       "https://github.com/" GITHUB_REPO "/releases/latest/download/esp-matter-hub.bin"
